@@ -1,0 +1,339 @@
+package com.examscanner.scanner
+
+import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint2f
+import org.opencv.core.Point
+import org.opencv.core.Scalar
+import org.opencv.core.Size
+import org.opencv.imgcodecs.Imgcodecs
+import org.opencv.imgproc.Imgproc
+import java.io.File
+import java.util.Locale
+import kotlin.math.max
+import kotlin.math.roundToInt
+
+object ScanEngine {
+    private const val MIN_PAGE_AREA = 0.12
+    private const val MIN_SHARPNESS = 12.0
+    private const val MIN_BRIGHTNESS = 65.0
+    private const val MAX_BRIGHTNESS = 235.0
+    private const val MAX_GLARE = 0.12
+    private const val MIN_COVERAGE = 0.85
+    private const val MIN_RING_STRENGTH = 12.0
+    private const val ORIENTATION_SCALE = 0.75
+
+    fun scan(
+        gray: Mat,
+        template: ExamTemplate,
+        debugFile: File? = null,
+        trace: ((String) -> Unit)? = null,
+        warpOut: Mat? = null,
+    ): ScanOutcome {
+        val started = System.nanoTime()
+        val elapsed = { (System.nanoTime() - started) / 1_000_000 }
+
+        if (gray.empty() || gray.cols() < 64 || gray.rows() < 64) {
+            return failure("error", "No se pudo leer la imagen.", elapsed())
+        }
+
+        val page = PageDetector.detect(gray)
+            ?: return failure(
+                "no_page",
+                "No se detecta la hoja. Apunta la cámara al examen y asegúrate de ver los cuatro bordes.",
+                elapsed(),
+                pageFound = false,
+            )
+        trace?.invoke("t page=${elapsed()}")
+        val pageAreaRatio = page.area() / (gray.cols().toDouble() * gray.rows().toDouble())
+        if (pageAreaRatio < MIN_PAGE_AREA) {
+            return failure(
+                "page_too_small",
+                "Acerca la hoja: debe ocupar la mayor parte del encuadre.",
+                elapsed(),
+                pageFound = true,
+                pageAreaRatio = pageAreaRatio,
+            )
+        }
+        trace?.invoke(String.format(Locale.US, "page area=%.3f", pageAreaRatio))
+
+        // Pick the page orientation before paying for a full-resolution fit. Evaluation
+        // halves keep the loop cheap, and the asymmetry of the printed grid (the third
+        // block only has three rows) makes the right orientation win by a wide margin.
+        var bestRotation = -1
+        var bestScore = 0.0
+        for (rotation in 0 until 4) {
+            val warp = warpToPage(gray, page.rolled(rotation), template, ORIENTATION_SCALE)
+            val fit = AnswerGrid.fit(warp, template, null)
+            warp.release()
+            val score = fit?.latticeScore ?: 0.0
+            trace?.invoke("t rot$rotation=${elapsed()}")
+            if (trace != null && fit != null) {
+                trace(
+                    String.format(
+                        Locale.US,
+                        "rot=%d cells=%d/%d extra=%d cols=%d rows=%d radius=%.1f score=%.1f",
+                        rotation,
+                        fit.matchedCells,
+                        fit.totalCells,
+                        fit.extraCells,
+                        fit.matchedColumns,
+                        fit.matchedRows,
+                        fit.radius,
+                        score,
+                    ),
+                )
+            }
+            if (fit != null && score > bestScore) {
+                bestRotation = rotation
+                bestScore = score
+            }
+            if (bestRotation >= 0 && bestScore >= 165.0) break
+        }
+        val rotation = if (bestRotation >= 0) bestRotation else 0
+
+        val warp = warpToPage(gray, page.rolled(rotation), template, 1.0)
+        val fit = AnswerGrid.fit(warp, template, trace)
+        val ringStrength = if (fit != null) AnswerGrid.ringStrength(warp, fit) else 0.0
+        val sharpness = PageDetector.sharpness(warp)
+        val brightness = PageDetector.brightness(warp)
+        val glare = PageDetector.glareRatio(warp)
+        trace?.invoke("t quality=${elapsed()}")
+        warpOut?.let { warp.copyTo(it) }
+        trace?.invoke(
+            String.format(
+                Locale.US,
+                "chosen rot=%d coverage=%.2f ring=%.1f sharpness=%.1f brightness=%.1f glare=%.3f",
+                rotation,
+                fit?.coverage ?: 0.0,
+                ringStrength,
+                sharpness,
+                brightness,
+                glare,
+            ),
+        )
+
+        val reasons = ArrayList<String>(4)
+        val messages = ArrayList<String>(4)
+        if (brightness < MIN_BRIGHTNESS) {
+            reasons.add("too_dark")
+            messages.add("Hay poca luz. Enciende la linterna o busca un lugar más claro.")
+        }
+        if (brightness > MAX_BRIGHTNESS) {
+            reasons.add("too_bright")
+            messages.add("La hoja está sobreexpuesta. Evita la luz directa.")
+        }
+        if (glare > MAX_GLARE) {
+            reasons.add("glare")
+            messages.add("Hay reflejos sobre la hoja. Cambia un poco el ángulo.")
+        }
+        if (sharpness < MIN_SHARPNESS) {
+            reasons.add("blurry")
+            messages.add("La foto está borrosa. Mantén el pulso y espera a que la cámara enfoque.")
+        }
+        if (fit == null) {
+            reasons.add("no_pattern")
+            messages.add("No se reconoce la hoja de respuestas. Verifica que sea la hoja correcta y que se vea completa.")
+        } else {
+            if (fit.coverage < MIN_COVERAGE) {
+                reasons.add("no_pattern")
+                messages.add("No se reconoce el patrón de burbujas. Verifica que sea la hoja correcta y que se vea completa.")
+            }
+            if (ringStrength < MIN_RING_STRENGTH) {
+                reasons.add("no_pattern")
+                messages.add("Las burbujas no se ven con nitidez. Acerca la hoja y mejora la iluminación.")
+            }
+        }
+
+        if (fit == null) {
+            warp.release()
+            return ScanOutcome(
+                ok = false,
+                reason = reasons.first(),
+                message = messages.first(),
+                answers = emptyList(),
+                warnings = emptyList(),
+                pageFound = true,
+                gridFound = false,
+                sharpness = sharpness,
+                brightness = brightness,
+                glare = glare,
+                latticeScore = ringStrength,
+                coverage = 0.0,
+                pageAreaRatio = pageAreaRatio,
+                orientation = rotation,
+                elapsedMs = elapsed(),
+            )
+        }
+
+        val answers = AnswerGrid.read(warp, template, fit)
+
+        val warnings = ArrayList<String>()
+        if (fit.matchedColumns < 15 || fit.matchedRows < 15) {
+            warnings.add("Algunas burbujas no se detectaron; revisa las marcas dudosas.")
+        }
+        val ambiguous = answers.filter { it.ambiguous }
+        ambiguous.take(5).forEach { answer ->
+            warnings.add("Pregunta ${answer.number}: marca dudosa o doble.")
+        }
+        if (ambiguous.size > 5) {
+            warnings.add("Y ${ambiguous.size - 5} preguntas más con marcas dudosas.")
+        }
+        val answered = answers.count { it.letter.isNotEmpty() }
+        if (answered == 0) {
+            warnings.add("No se detectó ninguna respuesta marcada.")
+        }
+
+        val ok = reasons.isEmpty()
+        val debugPath = if (debugFile != null) {
+            writeDebug(warp, fit, template, answers, debugFile)
+        } else {
+            null
+        }
+        val message = if (ok) "Hoja leída correctamente." else messages.first()
+        warp.release()
+
+        return ScanOutcome(
+            ok = ok,
+            reason = if (ok) "ok" else reasons.first(),
+            message = message,
+            answers = answers,
+            warnings = warnings,
+            pageFound = true,
+            gridFound = fit.coverage >= MIN_COVERAGE,
+            sharpness = sharpness,
+            brightness = brightness,
+            glare = glare,
+            latticeScore = ringStrength,
+            coverage = fit.coverage,
+            pageAreaRatio = pageAreaRatio,
+            orientation = rotation,
+            elapsedMs = elapsed(),
+            debugPath = debugPath,
+        )
+    }
+
+    private fun warpToPage(
+        gray: Mat,
+        quad: QuadD,
+        template: ExamTemplate,
+        scale: Double = 1.0,
+    ): Mat {
+        val width = (template.pageWidth * scale).roundToInt()
+        val height = (template.pageHeight * scale).roundToInt()
+        val source = MatOfPoint2f(*quad.points().map { Point(it.x, it.y) }.toTypedArray())
+        val destination = MatOfPoint2f(
+            Point(0.0, 0.0),
+            Point(width - 1.0, 0.0),
+            Point(width - 1.0, height - 1.0),
+            Point(0.0, height - 1.0),
+        )
+        val matrix = Imgproc.getPerspectiveTransform(source, destination)
+        val warped = Mat()
+        Imgproc.warpPerspective(
+            gray,
+            warped,
+            matrix,
+            Size(width.toDouble(), height.toDouble()),
+            Imgproc.INTER_LINEAR,
+        )
+        matrix.release()
+        source.release()
+        destination.release()
+        return warped
+    }
+
+    private fun writeDebug(
+        warp: Mat,
+        fit: AnswerGrid.Fit,
+        template: ExamTemplate,
+        answers: List<OutcomeAnswer>,
+        file: File,
+    ): String? = try {
+        file.parentFile?.mkdirs()
+        val debug = Mat()
+        Imgproc.cvtColor(warp, debug, Imgproc.COLOR_GRAY2BGR)
+        val answerByNumber = answers.associateBy { it.number }
+        for (column in fit.columns.indices) {
+            for (row in fit.rows.indices) {
+                Imgproc.circle(
+                    debug,
+                    Point(fit.columns[column], fit.rows[row]),
+                    max(2, (fit.radius * 0.8).roundToInt()),
+                    Scalar(190.0, 190.0, 190.0),
+                    1,
+                )
+            }
+        }
+        for (question in template.questions) {
+            val answer = answerByNumber[question.number]
+            val block = (question.number - 1) / 15
+            val row = when {
+                question.number <= 15 -> question.number - 1
+                question.number <= 30 -> question.number - 16
+                else -> question.number - 31
+            }
+            for ((index, option) in question.options.withIndex()) {
+                val x = fit.columns[block * 5 + index]
+                val y = fit.rows[row]
+                val color = when {
+                    answer == null -> Scalar(0.0, 0.0, 255.0)
+                    option.letter.toString() == answer.letter -> Scalar(0.0, 220.0, 0.0)
+                    else -> Scalar(170.0, 170.0, 170.0)
+                }
+                Imgproc.circle(
+                    debug,
+                    Point(x, y),
+                    max(3, (fit.radius * 0.8).roundToInt()),
+                    color,
+                    1,
+                )
+            }
+            if (answer != null && answer.letter.isNotEmpty()) {
+                val index = "ABCDE".indexOf(answer.letter)
+                if (index >= 0) {
+                    Imgproc.putText(
+                        debug,
+                        answer.letter,
+                        Point(
+                            fit.columns[block * 5 + index] + fit.radius + 2,
+                            fit.rows[row] + 5,
+                        ),
+                        Imgproc.FONT_HERSHEY_SIMPLEX,
+                        0.45,
+                        Scalar(0.0, 200.0, 0.0),
+                        1,
+                    )
+                }
+            }
+        }
+        Imgcodecs.imwrite(file.absolutePath, debug)
+        debug.release()
+        file.absolutePath
+    } catch (_: Throwable) {
+        null
+    }
+
+    private fun failure(
+        reason: String,
+        message: String,
+        elapsedMs: Long,
+        pageFound: Boolean = false,
+        pageAreaRatio: Double = 0.0,
+    ) = ScanOutcome(
+        ok = false,
+        reason = reason,
+        message = message,
+        answers = emptyList(),
+        warnings = emptyList(),
+        pageFound = pageFound,
+        gridFound = false,
+        sharpness = 0.0,
+        brightness = 0.0,
+        glare = 0.0,
+        latticeScore = 0.0,
+        coverage = 0.0,
+        pageAreaRatio = pageAreaRatio,
+        orientation = 0,
+        elapsedMs = elapsedMs,
+    )
+}
