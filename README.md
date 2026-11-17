@@ -95,3 +95,30 @@ To learn more about React Native, take a look at the following resources:
 - [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
 - [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
 - [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+
+## Step 1: Install the missing preset package
+``npm install --save-dev metro-react-native-babel-preset``
+## Step 2: Alternative (If using a newer React Native version)
+``npm install --save-dev @react-native/babel-preset``
+And change your babel.config.js to:
+``module.exports = {
+  presets: ['@react-native/babel-preset'],
+  plugins: [
+    '@babel/plugin-proposal-optional-chaining',
+    '@babel/plugin-transform-nullish-coalescing-operator',
+  ],
+};``
+## Step 3: Run your bundle command again
+``cd "c:\Users\User\desarrollo\scanner-react-native" && npx react-native bundle --platform android --dev false --entry-file index.js --bundle-output android/app/src/main/assets/index.android.bundle --assets-dest android/app/src/main/res/``
+## Solution: Run the commands separately
+
+``PowerShell
+cd "c:\Users\User\desarrollo\scanner-react-native\android"
+$env:JAVA_HOME="C:\Users\User\AppData\Local\Temp\opencode\toolchain\jdk17\jdk-17.0.21+9"
+$env:ANDROID_HOME="C:\Users\User\AppData\Local\Temp\opencode\toolchain\sdk"
+``
+
+``cd android
+.\gradlew.bat assembleDebug``
+
+``& "C:\Users\User\AppData\Local\Temp\opencode\toolchain\sdk\platform-tools\adb.exe" -s RF8T205KSQM install -r "c:\Users\User\desarrollo\scanner-react-native\android\app\build\outputs\apk\debug\app-debug.apk"``

@@ -14,11 +14,15 @@ import kotlin.math.roundToInt
 
 object ScanEngine {
     private const val MIN_PAGE_AREA = 0.12
-    private const val MIN_SHARPNESS = 12.0
+    private const val MIN_SHARPNESS = 8.0
     private const val MIN_BRIGHTNESS = 65.0
-    private const val MAX_BRIGHTNESS = 235.0
-    private const val MAX_GLARE = 0.12
-    private const val MIN_COVERAGE = 0.85
+    // Paper-white scans reach a mean of 255 with crisp print; a truly blown-out photo
+    // loses the lattice and fails the coverage gate, which is the better message.
+    private const val MAX_BRIGHTNESS = 255.0
+    private const val MAX_GLARE = 0.90
+    // 130/165 cells with 14 of 15 columns is a solid fit on a blurry desk photo; the
+    // remaining cells' positions come from the fitted lattice itself.
+    private const val MIN_COVERAGE = 0.75
     private const val MIN_RING_STRENGTH = 12.0
     private const val ORIENTATION_SCALE = 0.75
 
@@ -63,7 +67,7 @@ object ScanEngine {
         var bestScore = 0.0
         for (rotation in 0 until 4) {
             val warp = warpToPage(gray, page.rolled(rotation), template, ORIENTATION_SCALE)
-            val fit = AnswerGrid.fit(warp, template, null)
+            val fit = AnswerGrid.fit(warp, template, trace)
             warp.release()
             val score = fit?.latticeScore ?: 0.0
             trace?.invoke("t rot$rotation=${elapsed()}")
@@ -91,8 +95,26 @@ object ScanEngine {
         }
         val rotation = if (bestRotation >= 0) bestRotation else 0
 
+        // The small-scale warp reads blurry desk photos far better (downscaling shrinks
+        // the relative blur), so the first fit happens there. When it is not decisive,
+        // the full-scale warp is tried too and the better lattice wins; its coordinates
+        // are mapped onto the full-scale warp, which keeps answer reading at full detail.
+        val smallWarp = warpToPage(gray, page.rolled(rotation), template, ORIENTATION_SCALE)
+        val smallFit = AnswerGrid.fit(smallWarp, template, trace)
+        smallWarp.release()
+        var fit = smallFit
+        var fitScale = 1.0 / ORIENTATION_SCALE
+        if (smallFit == null || smallFit.coverage < 0.85) {
+            val fullWarp = warpToPage(gray, page.rolled(rotation), template, 1.0)
+            val fullFit = AnswerGrid.fit(fullWarp, template, trace)
+            fullWarp.release()
+            if (fullFit != null && (smallFit == null || fullFit.latticeScore > smallFit.latticeScore)) {
+                fit = fullFit
+                fitScale = 1.0
+            }
+        }
+        fit = fit?.scaled(fitScale)
         val warp = warpToPage(gray, page.rolled(rotation), template, 1.0)
-        val fit = AnswerGrid.fit(warp, template, trace)
         val ringStrength = if (fit != null) AnswerGrid.ringStrength(warp, fit) else 0.0
         val sharpness = PageDetector.sharpness(warp)
         val brightness = PageDetector.brightness(warp)
@@ -253,17 +275,43 @@ object ScanEngine {
         val debug = Mat()
         Imgproc.cvtColor(warp, debug, Imgproc.COLOR_GRAY2BGR)
         val answerByNumber = answers.associateBy { it.number }
+        val patternStroke = max(2, (fit.radius * 0.3).roundToInt())
         for (column in fit.columns.indices) {
             for (row in fit.rows.indices) {
                 Imgproc.circle(
                     debug,
                     Point(fit.columns[column], fit.rows[row]),
                     max(2, (fit.radius * 0.8).roundToInt()),
-                    Scalar(190.0, 190.0, 190.0),
-                    1,
+                    Scalar(255.0, 190.0, 115.0),
+                    patternStroke,
                 )
             }
         }
+
+        // Answer-grid box: the fitted lattice bounds, drawn so the photo review shows
+        // exactly what was treated as the answer area.
+        val pad = fit.radius * 1.6
+        val left = (fit.columns.min() - pad).coerceAtLeast(0.0)
+        val top = (fit.rows.min() - pad).coerceAtLeast(0.0)
+        val right = (fit.columns.max() + pad).coerceAtMost(warp.cols() - 1.0)
+        val bottom = (fit.rows.max() + pad).coerceAtMost(warp.rows() - 1.0)
+        Imgproc.rectangle(
+            debug,
+            Point(left, top),
+            Point(right, bottom),
+            Scalar(255.0, 166.0, 88.0),
+            max(3, (fit.radius * 0.5).roundToInt()),
+        )
+        Imgproc.putText(
+            debug,
+            "Cuadro de respuestas",
+            Point(left + pad * 0.2, max(14.0, top - 8.0)),
+            Imgproc.FONT_HERSHEY_SIMPLEX,
+            max(0.6, fit.radius / 14.0),
+            Scalar(255.0, 166.0, 88.0),
+            3,
+        )
+
         for (question in template.questions) {
             val answer = answerByNumber[question.number]
             val block = (question.number - 1) / 15

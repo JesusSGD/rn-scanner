@@ -45,16 +45,203 @@ object AnswerGrid {
         val latticeScore: Double
             get() = matchedCells.toDouble() - 0.5 * extraCells +
                 0.5 * (matchedColumns + matchedRows)
+
+        /** Maps a fit computed on a downscaled page warp onto the full-scale warp. */
+        fun scaled(factor: Double): Fit = copy(
+            columns = DoubleArray(columns.size) { columns[it] * factor },
+            rows = DoubleArray(rows.size) { rows[it] * factor },
+            radius = radius * factor,
+        )
     }
 
     private data class Circle(val x: Double, val y: Double, val r: Double)
 
     fun fit(gray: Mat, template: ExamTemplate, trace: ((String) -> Unit)? = null): Fit? {
+        // Primary: recover the lattice from the printed rings. Fallback: lay the
+        // template directly on the page warp and search a small global alignment —
+        // the page warp itself is usually accurate enough for the overlay to land
+        // on target even when ring detection fails.
+        val circlesFit = fitFromCircles(gray, template, trace, useSoftMask = false)
+        if (circlesFit != null && circlesFit.coverage >= 0.85) {
+            return circlesFit
+        }
+        val directFit = fitFromTemplate(gray, template, trace)
+        var best = when {
+            circlesFit == null -> directFit
+            directFit == null -> circlesFit
+            directFit.latticeScore > circlesFit.latticeScore -> directFit
+            else -> circlesFit
+        }
+        // Rescue path: binarized scans and very thin prints defeat both primaries,
+        // while a strong blur turns their thin rings into soft disks that a third
+        // mask recovers. It is gated behind a weak result because the extra mask
+        // also admits noise circles that corrupt an otherwise good lattice.
+        if (best == null || best.coverage < 0.75) {
+            val softFit = fitFromCircles(gray, template, trace, useSoftMask = true)
+            if (softFit != null && (best == null || softFit.latticeScore > best.latticeScore)) {
+                best = softFit
+            }
+        }
+        return best
+    }
+
+    /**
+     * Lays the template lattice on the page warp and scores candidate global
+     * alignments (scale + offset) by the ring darkness at the template positions.
+     * Each template circle then sits at its own position without detecting rings.
+     */
+    private fun fitFromTemplate(gray: Mat, template: ExamTemplate, trace: ((String) -> Unit)?): Fit? {
         val width = gray.cols()
         val height = gray.rows()
         if (width < 200 || height < 200) return null
         val unit = width / 1241.0
-        val circles = detectCircles(gray, unit)
+        val templateColumns = DoubleArray(COLUMNS) { index ->
+            val block = index / 5
+            val letter = index % 5
+            template.questions.first { it.number == block * 15 + 1 }.options[letter].x
+        }
+        val templateRows = DoubleArray(ROWS) { row ->
+            template.questions.first { it.number == row + 1 }.options[0].y
+        }
+
+        val integral = Mat()
+        Imgproc.integral(gray, integral, CvType.CV_32S)
+        val stride = integral.cols()
+        val data = IntArray(integral.rows() * stride)
+        integral.get(0, 0, data)
+        integral.release()
+        val ringRadius = max(5, ((template.bubbleRadius + 1.0) * unit).roundToInt())
+        val ring = ringKernel(ringRadius)
+        val center = discKernel(3)
+
+        // Which lattice cells actually exist: block 3 only has three rows, so the
+        // lower rows of its five columns are blank paper on the sheet.
+        val columnRowCount = IntArray(COLUMNS) { column -> if (column >= 10) 3 else 15 }
+        val rowColumnCount = IntArray(ROWS) { row -> if (row < 3) 15 else 10 }
+
+        fun evaluate(scaleX: Double, scaleY: Double, dx: Double, dy: Double): Triple<Int, DoubleArray, DoubleArray> {
+            val columns = DoubleArray(COLUMNS) { scaleX * templateColumns[it] + dx }
+            val rows = DoubleArray(ROWS) { scaleY * templateRows[it] + dy }
+            var rings = 0
+            for (column in 0 until COLUMNS) {
+                for (row in 0 until columnRowCount[column]) {
+                    val cx = columns[column].roundToInt()
+                    val cy = rows[row].roundToInt()
+                    val ringMean = boxMean(data, stride, width, height, cx, cy, ring)
+                    val centerMean = boxMean(data, stride, width, height, cx, cy, center)
+                    // A printed bubble reads as paper inside a dark ring; text or stray
+                    // marks are dark through and through, so this contrast only holds
+                    // for real rings.
+                    if (centerMean > ringMean + 4.0) rings++
+                }
+            }
+            return Triple(rings, columns, rows)
+        }
+
+        // Round 1: unit scale, offset search at a coarse step. The nested page quad can
+        // land several pixels off, so the reach must exceed the local fine steps.
+        var best = evaluate(1.0, 1.0, 0.0, 0.0)
+        var bestOffsetX = 0.0
+        var bestOffsetY = 0.0
+        val coarseStep = max(1.0, (2.0 * unit).roundToInt().toDouble())
+        val coarseReach = max(8.0 * unit, 0.02 * width)
+        var offsetDy = -coarseReach
+        while (offsetDy <= coarseReach) {
+            var offsetDx = -coarseReach
+            while (offsetDx <= coarseReach) {
+                val candidate = evaluate(1.0, 1.0, offsetDx, offsetDy)
+                if (candidate.first > best.first) {
+                    best = candidate
+                    bestOffsetX = offsetDx
+                    bestOffsetY = offsetDy
+                }
+                offsetDx += coarseStep
+            }
+            offsetDy += coarseStep
+        }
+
+        // Round 2: fine scale and offset around the coarse winner.
+        var bestScaleX = 1.0
+        var bestScaleY = 1.0
+        for (scaleX in doubleArrayOf(0.95, 0.975, 1.0, 1.025, 1.05)) {
+            for (scaleY in doubleArrayOf(0.95, 0.975, 1.0, 1.025, 1.05)) {
+                for (dy in doubleArrayOf(-2.0, -1.0, 0.0, 1.0, 2.0)) {
+                    for (dx in doubleArrayOf(-2.0, -1.0, 0.0, 1.0, 2.0)) {
+                        val candidate = evaluate(scaleX, scaleY, bestOffsetX + dx, bestOffsetY + dy)
+                        if (candidate.first > best.first) {
+                            best = candidate
+                            bestScaleX = scaleX
+                            bestScaleY = scaleY
+                            bestOffsetX += dx
+                            bestOffsetY += dy
+                        }
+                    }
+                }
+            }
+        }
+
+        val total = template.questions.sumOf { it.options.size }
+        if (best.first < total * 0.5) {
+            trace?.invoke("template fit rings=${best.first}")
+            return null
+        }
+        val columns = best.second
+        val rows = best.third
+        val columnRings = IntArray(COLUMNS)
+        val rowRings = IntArray(ROWS)
+        var rings = 0
+        for (column in 0 until COLUMNS) {
+            for (row in 0 until columnRowCount[column]) {
+                val cx = columns[column].roundToInt()
+                val cy = rows[row].roundToInt()
+                val ringMean = boxMean(data, stride, width, height, cx, cy, ring)
+                val centerMean = boxMean(data, stride, width, height, cx, cy, center)
+                if (centerMean > ringMean + 4.0) {
+                    rings++
+                    columnRings[column]++
+                    rowRings[row]++
+                }
+            }
+        }
+        // The blank tail of block 3 (its columns below the third row) must be paper;
+        // ring-like contrast there means the template is upside down or shifted, and
+        // every such hit is evidence against this alignment.
+        var blankHits = 0
+        for (column in 10 until COLUMNS) {
+            for (row in 3 until ROWS) {
+                val cx = columns[column].roundToInt()
+                val cy = rows[row].roundToInt()
+                val ringMean = boxMean(data, stride, width, height, cx, cy, ring)
+                val centerMean = boxMean(data, stride, width, height, cx, cy, center)
+                if (centerMean > ringMean + 4.0) blankHits++
+            }
+        }
+        trace?.invoke(
+            "template fit rings=$rings blank=$blankHits cols=${columnRings.count { it > 0 }} scale=$bestScaleX/$bestScaleY offset=${bestOffsetX},${bestOffsetY}",
+        )
+        return Fit(
+            columns = columns,
+            rows = rows,
+            radius = ringRadius.toDouble(),
+            matchedCells = rings,
+            totalCells = total,
+            extraCells = 2 * blankHits,
+            // Columns of block 3 only hold three cells, rows below the third hold ten.
+            matchedColumns = columnRings.indices.count { columnRings[it] >= (columnRowCount[it] * 3) / 4 },
+            matchedRows = rowRings.indices.count { rowRings[it] >= (rowColumnCount[it] * 3) / 4 },
+        )
+    }
+
+    private fun fitFromCircles(
+        gray: Mat,
+        template: ExamTemplate,
+        trace: ((String) -> Unit)?,
+        useSoftMask: Boolean,
+    ): Fit? {        val width = gray.cols()
+        val height = gray.rows()
+        if (width < 200 || height < 200) return null
+        val unit = width / 1241.0
+        val circles = detectCircles(gray, unit, useSoftMask)
         if (circles.size < 40) return null
 
         val templateColumns = DoubleArray(COLUMNS) { index ->
@@ -143,29 +330,25 @@ object AnswerGrid {
         if (pitch < 8.0 * unit) return null
         val tolerance = max(3.0 * unit, pitch * 0.35)
 
-        var matched = 0
-        var radiusSum = 0.0
-        for (question in template.questions) {
-            val block = (question.number - 1) / 15
-            val row = when {
-                question.number <= 15 -> question.number - 1
-                question.number <= 30 -> question.number - 16
-                else -> question.number - 31
-            }
-            for (option in question.options) {
-                val letterIndex = LETTERS.indexOf(option.letter)
-                if (letterIndex < 0) continue
-                val x = columns[block * 5 + letterIndex]
-                val y = rows[row]
-                val circle = circles.minByOrNull { (it.x - x) * (it.x - x) + (it.y - y) * (it.y - y) }
-                if (circle != null && abs(circle.x - x) <= tolerance && abs(circle.y - y) <= tolerance) {
-                    matched++
-                    radiusSum += circle.r
-                }
-            }
-        }
+        // Anchor the lattice on the printed rings: the initial fit is linear, so a page
+        // warp that is slightly off leaves the whole pattern shifted. Two passes of
+        // match-then-snap move every column and row onto the median center of the
+        // circles matched to its own cells, which is what the reading and the answer
+        // box are drawn from.
+        var cellMatches = matchCells(circles, template, columns, rows, tolerance)
+        var snapped = snapLattice(cellMatches, columns, rows)
+        cellMatches = matchCells(circles, template, snapped.first, snapped.second, tolerance)
+        snapped = snapLattice(cellMatches, snapped.first, snapped.second)
+        val finalColumns = snapped.first
+        val finalRows = snapped.second
+
+        val matched = cellMatches.size
+        val radiusSum = cellMatches.sumOf { it.circle.r }
         val total = template.questions.sumOf { it.options.size }
         if (matched == 0) return null
+        val finalMatchedColumns = finalColumns.count { column ->
+            columnPeaks.any { abs(it - column) <= columnTolerance }
+        }
 
         val expected = Array(COLUMNS) { BooleanArray(ROWS) }
         for (question in template.questions) {
@@ -179,22 +362,88 @@ object AnswerGrid {
         }
         var extra = 0
         for (circle in circles) {
-            val column = columns.indices.minByOrNull { abs(columns[it] - circle.x) } ?: continue
-            val row = rows.indices.minByOrNull { abs(rows[it] - circle.y) } ?: continue
-            if (abs(columns[column] - circle.x) > tolerance || abs(rows[row] - circle.y) > tolerance) continue
+            val column = finalColumns.indices.minByOrNull { abs(finalColumns[it] - circle.x) } ?: continue
+            val row = finalRows.indices.minByOrNull { abs(finalRows[it] - circle.y) } ?: continue
+            if (abs(finalColumns[column] - circle.x) > tolerance || abs(finalRows[row] - circle.y) > tolerance) continue
             if (!expected[column][row]) extra++
         }
 
         return Fit(
-            columns = columns,
-            rows = rows,
+            columns = finalColumns,
+            rows = finalRows,
             radius = (radiusSum / matched).coerceIn(3.0, 40.0),
             matchedCells = matched,
             totalCells = total,
             extraCells = extra,
-            matchedColumns = matchedColumns,
+            matchedColumns = finalMatchedColumns,
             matchedRows = rowFit.matched,
         )
+    }
+
+    private data class CellMatch(val column: Int, val row: Int, val circle: Circle)
+
+    /** Nearest printed circle within [tolerance] of every template cell. */
+    private fun matchCells(
+        circles: List<Circle>,
+        template: ExamTemplate,
+        columns: DoubleArray,
+        rows: DoubleArray,
+        tolerance: Double,
+    ): List<CellMatch> {
+        val matches = ArrayList<CellMatch>(columns.size * rows.size)
+        for (question in template.questions) {
+            val block = (question.number - 1) / 15
+            val row = when {
+                question.number <= 15 -> question.number - 1
+                question.number <= 30 -> question.number - 16
+                else -> question.number - 31
+            }
+            if (row !in rows.indices) continue
+            for (option in question.options) {
+                val letterIndex = LETTERS.indexOf(option.letter)
+                if (letterIndex < 0) continue
+                val column = block * 5 + letterIndex
+                if (column !in columns.indices) continue
+                val x = columns[column]
+                val y = rows[row]
+                val circle = circles.minByOrNull { (it.x - x) * (it.x - x) + (it.y - y) * (it.y - y) }
+                if (circle != null && abs(circle.x - x) <= tolerance && abs(circle.y - y) <= tolerance) {
+                    matches.add(CellMatch(column, row, circle))
+                }
+            }
+        }
+        return matches
+    }
+
+    /**
+     * Moves each column and row onto the median center of the circles matched to its
+     * cells. Columns and rows with fewer than three matched circles keep the linear
+     * fit, so a sparse area cannot drag its line away.
+     */
+    private fun snapLattice(
+        matches: List<CellMatch>,
+        columns: DoubleArray,
+        rows: DoubleArray,
+    ): Pair<DoubleArray, DoubleArray> {
+        val snappedColumns = columns.copyOf()
+        val snappedRows = rows.copyOf()
+        val columnValues = Array(columns.size) { ArrayList<Double>(rows.size) }
+        val rowValues = Array(rows.size) { ArrayList<Double>(columns.size) }
+        for (match in matches) {
+            columnValues[match.column].add(match.circle.x)
+            rowValues[match.row].add(match.circle.y)
+        }
+        for (index in columns.indices) {
+            if (columnValues[index].size >= 3) {
+                snappedColumns[index] = median(columnValues[index])
+            }
+        }
+        for (index in rows.indices) {
+            if (rowValues[index].size >= 3) {
+                snappedRows[index] = median(rowValues[index])
+            }
+        }
+        return snappedColumns to snappedRows
     }
 
     private data class BlockAlignment(val a: Double, val b: Double, val matched: Int)
@@ -350,7 +599,6 @@ object AnswerGrid {
     ): List<OutcomeAnswer> {
         val height = gray.rows()
         val width = gray.cols()
-        val radius = max(3, (fit.radius * 0.8).roundToInt())
         val filled = Mat()
         Imgproc.threshold(
             gray,
@@ -367,7 +615,9 @@ object AnswerGrid {
         integral.release()
         filled.release()
 
-        val kernel = discKernel(radius)
+        // Small disc: stays clear of the printed ring's ink, so an empty bubble reads
+        // near zero while a pen blob fills it almost completely.
+        val kernel = discKernel(max(3, (fit.radius * 0.55).roundToInt()))
         val answers = ArrayList<OutcomeAnswer>(template.questions.size)
         for (question in template.questions) {
             val block = (question.number - 1) / 15
@@ -515,12 +765,12 @@ object AnswerGrid {
         return a to (meanY - a * meanX)
     }
 
-    private fun detectCircles(gray: Mat, unit: Double): List<Circle> {
+    private fun detectCircles(gray: Mat, unit: Double, useSoftMask: Boolean = false): List<Circle> {
         val improved = Mat()
         Imgproc.createCLAHE(2.0, Size(8.0, 8.0)).apply(gray, improved)
         val blurred = Mat()
         Imgproc.GaussianBlur(improved, blurred, Size(3.0, 3.0), 0.0)
-        val masks = ArrayList<Mat>(2)
+        val masks = ArrayList<Pair<Mat, Double>>(3)
         try {
             val adaptiveBlock = max(15, (31 * unit).roundToInt() or 1)
             val adaptive = Mat()
@@ -533,7 +783,7 @@ object AnswerGrid {
                 adaptiveBlock,
                 max(3.0, 6.0 * unit),
             )
-            masks.add(adaptive)
+            masks.add(adaptive to 0.78)
 
             val kernel = Imgproc.getStructuringElement(
                 Imgproc.MORPH_ELLIPSE,
@@ -551,14 +801,34 @@ object AnswerGrid {
                 Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU,
             )
             blackHat.release()
-            masks.add(blackHatMask)
+            masks.add(blackHatMask to 0.78)
+
+            // Rescue mask for thin prints and binarized scans: a strong blur turns
+            // their thin rings into soft dark disks. Relaxed circularity, because the
+            // soft disks are less round than crisp printed rings.
+            if (useSoftMask) {
+                val soft = Mat()
+                Imgproc.GaussianBlur(blurred, soft, Size(9.0, 9.0), 0.0)
+                val softMask = Mat()
+                Imgproc.adaptiveThreshold(
+                    soft,
+                    softMask,
+                    255.0,
+                    Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    Imgproc.THRESH_BINARY_INV,
+                    adaptiveBlock,
+                    max(5.0, 9.0 * unit),
+                )
+                soft.release()
+                masks.add(softMask to 0.55)
+            }
 
             val raw = ArrayList<Circle>(256)
             val minArea = 60.0 * unit * unit
             val maxArea = 1600.0 * unit * unit
             val minRadius = 5.0 * unit
             val maxRadius = 22.0 * unit
-            for (mask in masks) {
+            for ((mask, minCircularity) in masks) {
                 val contours = ArrayList<MatOfPoint>()
                 val hierarchy = Mat()
                 Imgproc.findContours(
@@ -584,7 +854,7 @@ object AnswerGrid {
                     curve.release()
                     if (perimeter <= 0.0) continue
                     val circularity = 4.0 * PI * area / (perimeter * perimeter)
-                    if (circularity < 0.78) continue
+                    if (circularity < minCircularity) continue
                     if (radius[0] < minRadius || radius[0] > maxRadius) continue
                     raw.add(Circle(center.x, center.y, radius[0].toDouble()))
                 }
@@ -599,7 +869,7 @@ object AnswerGrid {
             }
             return kept
         } finally {
-            masks.forEach { it.release() }
+            masks.forEach { (mask, _) -> mask.release() }
             blurred.release()
             improved.release()
         }

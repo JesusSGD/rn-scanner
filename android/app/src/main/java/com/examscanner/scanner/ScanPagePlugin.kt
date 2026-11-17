@@ -4,6 +4,7 @@ import androidx.camera.core.ImageProxy
 import com.mrousavy.camera.frameprocessors.Frame
 import com.mrousavy.camera.frameprocessors.FrameProcessorPlugin
 import com.mrousavy.camera.frameprocessors.VisionCameraProxy
+import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import kotlin.math.hypot
@@ -21,6 +22,9 @@ import kotlin.math.roundToInt
  * The returned array is intentionally made of primitives only:
  * `[status, ready, stableFrames, areaRatio, brightness, glare, sharpness, tlX, tlY,
  *   trX, trY, brX, brY, blX, blY]`.
+ *
+ * Quad corners are normalized 0..1 in **display** orientation (after applying
+ * ImageProxy rotation), so JS can map them with `x * screenW`, `y * screenH`.
  */
 class ScanPagePlugin(
     @Suppress("UNUSED_PARAMETER") proxy: VisionCameraProxy,
@@ -40,11 +44,12 @@ class ScanPagePlugin(
         const val STATUS_READY = 7.0
 
         private const val TARGET_SIDE = 620
-        private const val MIN_AREA = 0.10
+        /** Match a guide that fills most of the preview (~90% width). */
+        private const val MIN_AREA = 0.28
         private const val MIN_BRIGHTNESS = 65.0
         private const val MAX_BRIGHTNESS = 235.0
         private const val MAX_GLARE = 0.10
-        private const val MIN_SHARPNESS = 30.0
+        private const val MIN_SHARPNESS = 20.0
         private const val REQUIRED_STABLE_FRAMES = 4
         private const val STABILITY_RATIO = 0.015
     }
@@ -64,7 +69,7 @@ class ScanPagePlugin(
             val glare = PageDetector.glareRatio(gray)
             val page = PageDetector.detect(gray)
             val quad = if (page != null) {
-                doubleArrayOf(page.tl.x, page.tl.y, page.tr.x, page.tr.y, page.br.x, page.br.y, page.bl.x, page.bl.y)
+                normalizeQuad(page, width, height)
             } else {
                 doubleArrayOf()
             }
@@ -89,7 +94,7 @@ class ScanPagePlugin(
                 return result(status, 0, 0.0, areaRatio, brightness, glare, sharpness, quad)
             }
 
-            val threshold = STABILITY_RATIO * hypot(width.toDouble(), height.toDouble())
+            val threshold = STABILITY_RATIO
             val previous = previousQuad
             val still = previous != null && maxCornerShift(previous, quad) <= threshold
             stableFrames = if (still) stableFrames + 1 else 1
@@ -108,11 +113,22 @@ class ScanPagePlugin(
 
     /** Corners must be a little away from the frame edge so the whole sheet is visible. */
     private fun nearBorder(page: QuadD, width: Int, height: Int): Boolean {
-        val marginX = max(2.0, 0.01 * width)
-        val marginY = max(2.0, 0.01 * height)
+        val marginX = max(2.0, 0.015 * width)
+        val marginY = max(2.0, 0.015 * height)
         return page.points().any {
             it.x <= marginX || it.y <= marginY || it.x >= width - marginX || it.y >= height - marginY
         }
+    }
+
+    private fun normalizeQuad(page: QuadD, width: Int, height: Int): DoubleArray {
+        val w = width.toDouble().coerceAtLeast(1.0)
+        val h = height.toDouble().coerceAtLeast(1.0)
+        return doubleArrayOf(
+            page.tl.x / w, page.tl.y / h,
+            page.tr.x / w, page.tr.y / h,
+            page.br.x / w, page.br.y / h,
+            page.bl.x / w, page.bl.y / h,
+        )
     }
 
     private fun maxCornerShift(previous: DoubleArray, current: DoubleArray): Double {
@@ -149,8 +165,8 @@ class ScanPagePlugin(
     }
 
     /**
-     * Samples the luma plane into a small grayscale Mat. Sampling instead of resizing
-     * avoids copying the full-resolution frame on the hot path.
+     * Samples the luma plane into a small grayscale Mat in **display** orientation.
+     * Sampling instead of resizing avoids copying the full-resolution frame on the hot path.
      */
     private fun toGray(image: ImageProxy): Mat? {
         val planes = image.planes
@@ -185,8 +201,24 @@ class ScanPagePlugin(
         }
         while (out < size) pixelBuffer[out++] = 0
 
-        val gray = Mat(outHeight, outWidth, CvType.CV_8UC1)
-        gray.put(0, 0, pixelBuffer)
-        return gray
+        val sensorGray = Mat(outHeight, outWidth, CvType.CV_8UC1)
+        sensorGray.put(0, 0, pixelBuffer)
+        return rotateToDisplay(sensorGray, image.imageInfo.rotationDegrees)
+    }
+
+    /** Rotates sensor-buffer gray into the same orientation the preview shows. */
+    private fun rotateToDisplay(sensorGray: Mat, rotationDegrees: Int): Mat {
+        val flag = when (((rotationDegrees % 360) + 360) % 360) {
+            90 -> Core.ROTATE_90_CLOCKWISE
+            180 -> Core.ROTATE_180
+            270 -> Core.ROTATE_90_COUNTERCLOCKWISE
+            else -> {
+                return sensorGray
+            }
+        }
+        val rotated = Mat()
+        Core.rotate(sensorGray, rotated, flag)
+        sensorGray.release()
+        return rotated
     }
 }

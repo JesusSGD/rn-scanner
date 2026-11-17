@@ -29,11 +29,8 @@ type LiveState = {
   status: number;
   ready: boolean;
   stable: number;
-  // Quad corners in screen-relative 0..1 coords (tl,tr,br,bl x,y)
+  // Quad corners in display-relative 0..1 coords (tl,tr,br,bl x,y)
   quad: number[] | null;
-  // Frame dimensions when quad was captured (to map to screen)
-  frameW: number;
-  frameH: number;
 };
 
 const REQUIRED_STABLE = 4;
@@ -63,8 +60,6 @@ export default function ScannerScreen({onResult}: Props) {
     ready: false,
     stable: 0,
     quad: null,
-    frameW: 1,
-    frameH: 1,
   });
   const [torch, setTorch] = useState(false);
   const [processing, setProcessing] = useState(false);
@@ -83,14 +78,7 @@ export default function ScannerScreen({onResult}: Props) {
   }, []);
 
   const onLive = useRunOnJS(
-    (
-      status: number,
-      ready: number,
-      stable: number,
-      quadPoints: number[],
-      frameW: number,
-      frameH: number,
-    ) => {
+    (status: number, ready: number, stable: number, quadPoints: number[]) => {
       setLive(previous => {
         const nextQuad = quadPoints.length === 8 ? quadPoints : null;
         if (
@@ -101,7 +89,7 @@ export default function ScannerScreen({onResult}: Props) {
         ) {
           return previous;
         }
-        return {status, ready: ready === 1, stable, quad: nextQuad, frameW, frameH};
+        return {status, ready: ready === 1, stable, quad: nextQuad};
       });
     },
     [],
@@ -129,10 +117,11 @@ export default function ScannerScreen({onResult}: Props) {
         return;
       }
       // values: [status, ready, stable, areaRatio, brightness, glare, sharpness, tlX, tlY, trX, trY, brX, brY, blX, blY]
+      // Quad corners are already 0..1 in display orientation.
       const quad: number[] = values.length >= 15
         ? [values[7], values[8], values[9], values[10], values[11], values[12], values[13], values[14]]
         : [];
-      onLive(values[0], values[1], values[2], quad, frame.width, frame.height);
+      onLive(values[0], values[1], values[2], quad);
       if (values[1] === 1) {
         onReady();
       }
@@ -184,6 +173,21 @@ export default function ScannerScreen({onResult}: Props) {
 
   captureRef.current = capture;
 
+  // Native returns display-oriented 0..1 corners; map straight onto the preview.
+  const quadPolygon = useMemo(() => {
+    const q = live.quad;
+    if (!q || q.length < 8) {
+      return null;
+    }
+    const pts = [
+      {x: q[0] * screenW, y: q[1] * screenH},
+      {x: q[2] * screenW, y: q[3] * screenH},
+      {x: q[4] * screenW, y: q[5] * screenH},
+      {x: q[6] * screenW, y: q[7] * screenH},
+    ];
+    return pts.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+  }, [live.quad, screenW, screenH]);
+
   if (!hasPermission) {
     return (
       <View style={styles.centered}>
@@ -213,26 +217,6 @@ export default function ScannerScreen({onResult}: Props) {
       ? 'Capturando…'
       : STATUS_MESSAGES[7]
     : STATUS_MESSAGES[live.status] ?? STATUS_MESSAGES[0];
-
-  // Build SVG polygon points from frame-space quad → screen coords
-  const quadPolygon = useMemo(() => {
-    const q = live.quad;
-    if (!q || q.length < 8 || live.frameW <= 0 || live.frameH <= 0) {
-      return null;
-    }
-    // The camera frame is in landscape internally but rendered portrait on screen.
-    // VisionCamera handles the rotation, so the quad coords (from the downsampled
-    // luma plane) are already in display orientation: x→width, y→height of preview.
-    const scaleX = screenW / live.frameW;
-    const scaleY = screenH / live.frameH;
-    const pts = [
-      {x: q[0] * scaleX, y: q[1] * scaleY},   // TL
-      {x: q[2] * scaleX, y: q[3] * scaleY},   // TR
-      {x: q[4] * scaleX, y: q[5] * scaleY},   // BR
-      {x: q[6] * scaleX, y: q[7] * scaleY},   // BL
-    ];
-    return pts.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
-  }, [live.quad, live.frameW, live.frameH, screenW, screenH]);
 
   return (
     <View style={styles.container}>
@@ -271,7 +255,7 @@ export default function ScannerScreen({onResult}: Props) {
         </View>
       </View>
 
-      {/* Live quad overlay — only shown when a page is detected */}
+  {/* Live quad overlay — only shown when a page is detected */}
       {quadPolygon ? (
         <Svg
           pointerEvents="none"
@@ -337,8 +321,7 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#000000',
-  },
-  centered: {
+  },  centered: {
     flex: 1,
     backgroundColor: '#0d1117',
     alignItems: 'center',
@@ -420,12 +403,12 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   guide: {
-    width: '76%',
-    maxWidth: 420,
-    aspectRatio: 0.7,
+    width: '90%',
+    maxWidth: 520,
+    aspectRatio: 0.707,
     borderWidth: 1.5,
     borderColor: 'rgba(255,255,255,0.55)',
-    borderRadius: 18,
+    borderRadius: 14,
   },
   guideReady: {
     borderColor: 'rgba(63,185,80,0.9)',

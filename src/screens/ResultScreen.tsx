@@ -75,7 +75,7 @@ export default function ResultScreen({result, onRetry}: Props) {
               resizeMode="contain"
             />
             <Text style={styles.debugHint}>
-              Verde = marcada · Gris = vacía · Rojo = sin respuesta
+              Azul = cuadro de respuestas · Verde = marcada · Gris = vacía · Rojo = sin respuesta
             </Text>
           </View>
         ) : null}

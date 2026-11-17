@@ -38,9 +38,39 @@ fun main(args: Array<String>) {
     OpenCV.loadLocally()
     val root = File(args.getOrNull(2) ?: "../..").absoluteFile
     val templateFile = File(args.getOrNull(1) ?: "$root/android/app/src/main/assets/template.json")
-    val fixturesDir = File("$root/tools/verify/fixtures")
     val template = ExamTemplate.parse(templateFile.readText())
     val verbose = System.getenv("VERIFY_TRACE") != null
+
+    // Batch mode: scan every image in a directory and report, without fixture
+    // expectations. Used to triage real captures pulled off a device.
+    val input = File(args.getOrNull(0) ?: "$root/tools/verify/fixtures")
+    if (input.isDirectory) {
+        for (file in input.listFiles()!!.sortedBy { it.name }) {
+            if (!file.name.endsWith(".jpg", true) && !file.name.endsWith(".png", true)) continue
+            val image: Mat = Imgcodecs.imread(file.absolutePath, Imgcodecs.IMREAD_GRAYSCALE)
+            if (image.empty()) continue
+            val outcome = ScanEngine.scan(
+                image,
+                template,
+                null,
+                if (verbose) ({ line -> println("  trace $line") }) else null,
+            )
+            image.release()
+            val answers = outcome.answers.filter { it.letter.isNotEmpty() }
+                .joinToString(",") { "${it.number}:${it.letter}${if (it.ambiguous) "?" else ""}" }
+            println(
+                "${file.name} ok=${outcome.ok} reason=${outcome.reason} page=${outcome.pageFound} " +
+                    "rot=${outcome.orientation} cov=${String.format(Locale.US, "%.2f", outcome.coverage)} " +
+                    "area=${String.format(Locale.US, "%.2f", outcome.pageAreaRatio)} " +
+                    "sharp=${String.format(Locale.US, "%.0f", outcome.sharpness)} " +
+                    "bright=${String.format(Locale.US, "%.0f", outcome.brightness)} " +
+                    "ms=${outcome.elapsedMs} ans=[$answers]",
+            )
+        }
+        return
+    }
+
+    val fixturesDir = File("$root/tools/verify/fixtures")
 
     val failures = ArrayList<String>()
 
