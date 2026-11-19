@@ -20,41 +20,120 @@ import kotlin.math.sqrt
  * The page warp only has to make the sheet roughly upright; the absolute position and
  * scale of the form inside the warp are recovered from the printed bubble rings, so the
  * reading does not depend on how exactly the page contour was found.
+ *
+ * Every sheet of the family prints the same five-option block (A-E by fifteen rows), but
+ * the exam may need one to six blocks side by side, and the last block may print only
+ * some of its rows. Both come from the page itself, so a sheet with two blocks fits a
+ * two-block grid instead of being forced onto the three-block template.
  */
 object AnswerGrid {
-    private const val BLOCKS = 3
-    private const val PER_BLOCK = 5
-    private const val COLUMNS = BLOCKS * PER_BLOCK
-    private const val ROWS = 15
-    private const val LETTERS = "ABCDE"
+    const val PER_BLOCK = 5
+    const val LETTERS = "ABCDE"
+    const val QUESTIONS_PER_BLOCK = 15
+    private const val MAX_BLOCKS = 6
+    // A pixel this much darker than the paper beside it is ink. The level is measured per
+    // question row, because exposure and shadows drift across a photographed page.
+    private const val INK_MARGIN = 0.10
+    private const val MIN_INK_MARGIN = 12.0
 
     data class Fit(
+        /** One x coordinate per option column: block * [PER_BLOCK] + letter. */
         val columns: DoubleArray,
+        /** One y coordinate per printed row of a block. */
         val rows: DoubleArray,
+        /** Printed rows per block; the last block may hold fewer than the others. */
+        val blockRows: IntArray,
         val radius: Double,
         val matchedCells: Int,
-        val totalCells: Int,
         val extraCells: Int,
         val matchedColumns: Int,
         val matchedRows: Int,
+        /**
+         * Distance between the fitted rows and where the template says the answer grid
+         * sits on the page, as a fraction of the page height. The grid always lies in the
+         * lower half of the sheet, which is what tells a sheet read upside down from the
+         * right side when the printed layout itself is vertically symmetric (one block,
+         * or every block complete).
+         */
+        val positionError: Double,
     ) {
-        /** Fraction of template bubbles that sit on a detected printed ring. */
+        /** Cells of the detected structure only; blank paper after the last block is excluded. */
+        val totalCells: Int get() = PER_BLOCK * blockRows.sum()
+
+        /** Fraction of expected bubbles that sit on a detected printed ring. */
         val coverage: Double get() = if (totalCells == 0) 0.0 else matchedCells.toDouble() / totalCells
 
-        /** Score used to pick the page orientation: real cells count, foreign rings do not. */
+        /**
+         * Score used to pick the page orientation: real cells count, foreign rings do not,
+         * and a lattice away from the grid's usual place on the page is penalised.
+         */
         val latticeScore: Double
             get() = matchedCells.toDouble() - 0.5 * extraCells +
-                0.5 * (matchedColumns + matchedRows)
+                0.5 * (matchedColumns + matchedRows) - 100.0 * positionError
 
         /** Maps a fit computed on a downscaled page warp onto the full-scale warp. */
         fun scaled(factor: Double): Fit = copy(
             columns = DoubleArray(columns.size) { columns[it] * factor },
             rows = DoubleArray(rows.size) { rows[it] * factor },
             radius = radius * factor,
+            blockRows = blockRows.copyOf(),
         )
     }
 
     private data class Circle(val x: Double, val y: Double, val r: Double)
+
+    /**
+     * Fixed geometry of the sheet family, recovered from the template: where each block
+     * starts, how the five option columns are spaced inside a block, and where the rows
+     * sit. Only the template's own blocks are known; the remaining ones are extrapolated
+     * so sheets with four to six blocks can still be anchored.
+     */
+    private data class Model(
+        val blockOrigins: DoubleArray,
+        val columnOffsets: DoubleArray,
+        val templateRows: DoubleArray,
+    ) {
+        /** Absolute x of every option column of the six possible blocks. */
+        fun columns(): DoubleArray = DoubleArray(MAX_BLOCKS * PER_BLOCK) { index ->
+            blockOrigins[index / PER_BLOCK] + columnOffsets[index % PER_BLOCK]
+        }
+    }
+
+    private fun buildModel(template: ExamTemplate): Model? {
+        if (template.questions.isEmpty()) return null
+        val rowsByBlock = HashMap<Int, MutableList<Double>>()
+        val firstColumnByBlock = HashMap<Int, Double>()
+        for (question in template.questions) {
+            val block = (question.number - 1) / QUESTIONS_PER_BLOCK
+            rowsByBlock.getOrPut(block) { ArrayList() }.add(question.options.first().y)
+            val left = question.options.minOf { it.x }
+            firstColumnByBlock[block] = minOf(firstColumnByBlock[block] ?: Double.MAX_VALUE, left)
+        }
+
+        // The block with the most printed rows gives the row model (normally the first).
+        val templateRows = rowsByBlock.values.maxByOrNull { it.size }?.sorted()?.toDoubleArray()
+            ?: return null
+        if (templateRows.size < 4) return null
+
+        val knownBlocks = firstColumnByBlock.keys.sorted()
+        if (knownBlocks.isEmpty()) return null
+        val origins = ArrayList<Double>(MAX_BLOCKS)
+        for (block in knownBlocks) origins.add(firstColumnByBlock.getValue(block))
+        val pitch = if (origins.size >= 2) (origins.last() - origins.first()) / (origins.size - 1) else 0.0
+        while (origins.size < MAX_BLOCKS) {
+            if (pitch <= 0.0) break
+            origins.add(origins.last() + pitch)
+        }
+
+        val firstQuestion = template.questions.first {
+            (it.number - 1) / QUESTIONS_PER_BLOCK == knownBlocks.first()
+        }
+        val optionXs = firstQuestion.options.map { it.x }.sorted()
+        if (optionXs.size != PER_BLOCK) return null
+        val offsets = DoubleArray(PER_BLOCK) { optionXs[it] - optionXs[0] }
+
+        return Model(origins.toDoubleArray(), offsets, templateRows)
+    }
 
     fun fit(gray: Mat, template: ExamTemplate, trace: ((String) -> Unit)? = null): Fit? {
         // Primary: recover the lattice from the printed rings. Fallback: lay the
@@ -95,14 +174,8 @@ object AnswerGrid {
         val height = gray.rows()
         if (width < 200 || height < 200) return null
         val unit = width / 1241.0
-        val templateColumns = DoubleArray(COLUMNS) { index ->
-            val block = index / 5
-            val letter = index % 5
-            template.questions.first { it.number == block * 15 + 1 }.options[letter].x
-        }
-        val templateRows = DoubleArray(ROWS) { row ->
-            template.questions.first { it.number == row + 1 }.options[0].y
-        }
+        val model = buildModel(template) ?: return null
+        val modelColumns = model.columns()
 
         val integral = Mat()
         Imgproc.integral(gray, integral, CvType.CV_32S)
@@ -114,25 +187,23 @@ object AnswerGrid {
         val ring = ringKernel(ringRadius)
         val center = discKernel(3)
 
-        // Which lattice cells actually exist: block 3 only has three rows, so the
-        // lower rows of its five columns are blank paper on the sheet.
-        val columnRowCount = IntArray(COLUMNS) { column -> if (column >= 10) 3 else 15 }
-        val rowColumnCount = IntArray(ROWS) { row -> if (row < 3) 15 else 10 }
+        fun contrast(cx: Int, cy: Int): Boolean {
+            val ringMean = boxMean(data, stride, width, height, cx, cy, ring)
+            val centerMean = boxMean(data, stride, width, height, cx, cy, center)
+            // A printed bubble reads as paper inside a dark ring; text or stray
+            // marks are dark through and through, so this contrast only holds
+            // for real rings.
+            return centerMean > ringMean + 4.0
+        }
 
         fun evaluate(scaleX: Double, scaleY: Double, dx: Double, dy: Double): Triple<Int, DoubleArray, DoubleArray> {
-            val columns = DoubleArray(COLUMNS) { scaleX * templateColumns[it] + dx }
-            val rows = DoubleArray(ROWS) { scaleY * templateRows[it] + dy }
+            val columns = DoubleArray(modelColumns.size) { scaleX * modelColumns[it] + dx }
+            val rows = DoubleArray(model.templateRows.size) { scaleY * model.templateRows[it] + dy }
             var rings = 0
-            for (column in 0 until COLUMNS) {
-                for (row in 0 until columnRowCount[column]) {
-                    val cx = columns[column].roundToInt()
-                    val cy = rows[row].roundToInt()
-                    val ringMean = boxMean(data, stride, width, height, cx, cy, ring)
-                    val centerMean = boxMean(data, stride, width, height, cx, cy, center)
-                    // A printed bubble reads as paper inside a dark ring; text or stray
-                    // marks are dark through and through, so this contrast only holds
-                    // for real rings.
-                    if (centerMean > ringMean + 4.0) rings++
+            for (column in columns) {
+                val cx = column.roundToInt()
+                for (row in rows) {
+                    if (contrast(cx, row.roundToInt())) rings++
                 }
             }
             return Triple(rings, columns, rows)
@@ -180,55 +251,90 @@ object AnswerGrid {
             }
         }
 
-        val total = template.questions.sumOf { it.options.size }
-        if (best.first < total * 0.5) {
-            trace?.invoke("template fit rings=${best.first}")
-            return null
-        }
         val columns = best.second
         val rows = best.third
-        val columnRings = IntArray(COLUMNS)
-        val rowRings = IntArray(ROWS)
-        var rings = 0
-        for (column in 0 until COLUMNS) {
-            for (row in 0 until columnRowCount[column]) {
-                val cx = columns[column].roundToInt()
-                val cy = rows[row].roundToInt()
-                val ringMean = boxMean(data, stride, width, height, cx, cy, ring)
-                val centerMean = boxMean(data, stride, width, height, cx, cy, center)
-                if (centerMean > ringMean + 4.0) {
-                    rings++
-                    columnRings[column]++
-                    rowRings[row]++
+        val rowCount = rows.size
+
+        // Which blocks and rows are actually printed: a row counts as printed when at
+        // least three of its five bubbles show the ring contrast. Blocks are taken as a
+        // contiguous run from the first one, and a printed block always has its top
+        // rows, so the first block without printed rows ends the structure.
+        val blockRows = IntArray(MAX_BLOCKS)
+        for (block in 0 until MAX_BLOCKS) {
+            if (block > 0 && blockRows[block - 1] == 0) break
+            var topPrinted = false
+            var last = -1
+            for (row in 0 until rowCount) {
+                var printed = 0
+                for (letter in 0 until PER_BLOCK) {
+                    if (contrast(columns[block * PER_BLOCK + letter].roundToInt(), rows[row].roundToInt())) printed++
+                }
+                if (printed >= 3) {
+                    if (row == 0) topPrinted = true
+                    last = row
+                }
+            }
+            blockRows[block] = if (topPrinted) last + 1 else 0
+        }
+        var blockCount = blockRows.size
+        while (blockCount > 0 && blockRows[blockCount - 1] == 0) blockCount--
+        if (blockCount == 0) {
+            trace?.invoke("template fit rings=${best.first} blocks=0")
+            return null
+        }
+        val structure = blockRows.copyOf(blockCount)
+        val finalColumns = columns.copyOf(blockCount * PER_BLOCK)
+        val total = PER_BLOCK * structure.sum()
+
+        // Every ring found inside the structure is a matched cell; a ring-like blob
+        // outside it (below the last block's rows, or where no block is printed) means
+        // the template is upside down or shifted, so it is evidence against this fit.
+        val columnRings = IntArray(blockCount * PER_BLOCK)
+        val rowRings = IntArray(rowCount)
+        for (block in 0 until blockCount) {
+            for (row in 0 until structure[block]) {
+                for (letter in 0 until PER_BLOCK) {
+                    if (contrast(columns[block * PER_BLOCK + letter].roundToInt(), rows[row].roundToInt())) {
+                        columnRings[block * PER_BLOCK + letter]++
+                        rowRings[row]++
+                    }
                 }
             }
         }
-        // The blank tail of block 3 (its columns below the third row) must be paper;
-        // ring-like contrast there means the template is upside down or shifted, and
-        // every such hit is evidence against this alignment.
         var blankHits = 0
-        for (column in 10 until COLUMNS) {
-            for (row in 3 until ROWS) {
-                val cx = columns[column].roundToInt()
-                val cy = rows[row].roundToInt()
-                val ringMean = boxMean(data, stride, width, height, cx, cy, ring)
-                val centerMean = boxMean(data, stride, width, height, cx, cy, center)
-                if (centerMean > ringMean + 4.0) blankHits++
+        for (block in 0 until MAX_BLOCKS) {
+            for (row in 0 until rowCount) {
+                if (block < blockCount && row < structure[block]) continue
+                for (letter in 0 until PER_BLOCK) {
+                    if (contrast(columns[block * PER_BLOCK + letter].roundToInt(), rows[row].roundToInt())) blankHits++
+                }
             }
         }
+        val rings = columnRings.sum()
+        if (rings < total * 0.5) {
+            trace?.invoke("template fit rings=$rings blocks=$blockCount")
+            return null
+        }
         trace?.invoke(
-            "template fit rings=$rings blank=$blankHits cols=${columnRings.count { it > 0 }} scale=$bestScaleX/$bestScaleY offset=${bestOffsetX},${bestOffsetY}",
+            "template fit rings=$rings blank=$blankHits blocks=$blockCount rows=${structure.joinToString(",")} " +
+                "scale=$bestScaleX/$bestScaleY offset=${bestOffsetX},${bestOffsetY}",
         )
+        var matchedRows = 0
+        for (row in 0 until rowCount) {
+            var rowCells = 0
+            for (block in 0 until blockCount) if (row < structure[block]) rowCells += PER_BLOCK
+            if (rowCells > 0 && rowRings[row] >= (rowCells * 3) / 4) matchedRows++
+        }
         return Fit(
-            columns = columns,
+            columns = finalColumns,
             rows = rows,
+            blockRows = structure,
             radius = ringRadius.toDouble(),
             matchedCells = rings,
-            totalCells = total,
             extraCells = 2 * blankHits,
-            // Columns of block 3 only hold three cells, rows below the third hold ten.
-            matchedColumns = columnRings.indices.count { columnRings[it] >= (columnRowCount[it] * 3) / 4 },
-            matchedRows = rowRings.indices.count { rowRings[it] >= (rowColumnCount[it] * 3) / 4 },
+            matchedColumns = columnRings.indices.count { columnRings[it] >= (structure[it / PER_BLOCK] * 3) / 4 },
+            matchedRows = matchedRows,
+            positionError = positionError(model, unit, rows, height),
         )
     }
 
@@ -237,21 +343,14 @@ object AnswerGrid {
         template: ExamTemplate,
         trace: ((String) -> Unit)?,
         useSoftMask: Boolean,
-    ): Fit? {        val width = gray.cols()
+    ): Fit? {
+        val width = gray.cols()
         val height = gray.rows()
         if (width < 200 || height < 200) return null
         val unit = width / 1241.0
         val circles = detectCircles(gray, unit, useSoftMask)
         if (circles.size < 40) return null
-
-        val templateColumns = DoubleArray(COLUMNS) { index ->
-            val block = index / 5
-            val letter = index % 5
-            template.questions.first { it.number == block * 15 + 1 }.options[letter].x
-        }
-        val templateRows = DoubleArray(ROWS) { row ->
-            template.questions.first { it.number == row + 1 }.options[0].y
-        }
+        val model = buildModel(template) ?: return null
 
         val columnPeaks = peaks(circles.map { it.x }, unit)
         val rowPeaks = peaks(circles.map { it.y }, unit)
@@ -260,159 +359,291 @@ object AnswerGrid {
             trace("colPeaks " + columnPeaks.joinToString(" ") { String.format(Locale.US, "%.1f", it) })
             trace("rowPeaks " + rowPeaks.joinToString(" ") { String.format(Locale.US, "%.1f", it) })
         }
-        if (columnPeaks.size < 8 || rowPeaks.size < 8) return null
+        if (columnPeaks.size < 4 || rowPeaks.size < 8) return null
 
-        val rowFit = align(rowPeaks, templateRows, unit) ?: return null
+        val rowFit = align(rowPeaks, model.templateRows, unit) ?: return null
         if (rowFit.matched < 10) return null
+        val rows = DoubleArray(model.templateRows.size) { rowFit.a * model.templateRows[it] + rowFit.b }
+        val rowPitch = rowPitch(rows)
+        if (rowPitch < 8.0 * unit) return null
+        val cellTolerance = max(3.0 * unit, rowPitch * 0.35)
 
         // Column pitch comes from the printed lattice itself: the median gap between
         // detected columns is the within-block pitch, which is unaffected by the wide
         // gaps between blocks and by stray detections elsewhere on the page.
         val columnPitch = medianGap(columnPeaks) ?: return null
         if (columnPitch < 8.0 * unit) return null
-        val pitchScale = columnPitch / templatePitch(templateColumns)
+        val pitchScale = columnPitch / offsetsPitch(model.columnOffsets)
         if (!pitchScale.isFinite() || pitchScale < 0.45 || pitchScale > 1.7) return null
         val columnTolerance = max(3.0 * unit, 0.30 * columnPitch)
 
-        val globalOffset = voteOffset(columnPeaks, templateColumns, pitchScale, columnTolerance)
-            ?: return null
-        trace?.invoke(
-            String.format(
-                Locale.US,
-                "columns pitch=%.1f scale=%.3f offset=%.1f",
-                columnPitch,
-                pitchScale,
-                globalOffset,
-            ),
-        )
-
-        val columns = DoubleArray(COLUMNS)
-        for (block in 0 until BLOCKS) {
-            val first = pitchScale * templateColumns[block * PER_BLOCK] + globalOffset
-            val last = pitchScale * templateColumns[block * PER_BLOCK + PER_BLOCK - 1] + globalOffset
-            val group = columnPeaks.filter { it >= first - 0.75 * columnPitch && it <= last + 0.75 * columnPitch }
-            val alignment = alignGroup(
-                group,
-                templateColumns,
-                block,
-                pitchScale,
-                columnPitch,
-                columnTolerance,
-                globalOffset,
-            )
-            val a = alignment?.a ?: pitchScale
-            val b = alignment?.b ?: globalOffset
-            if (trace != null) {
-                trace(
-                    String.format(
-                        Locale.US,
-                        "block %d peaks=%d scale=%.3f offset=%.1f",
-                        block,
-                        alignment?.matched ?: 0,
-                        a,
-                        b,
-                    ),
-                )
-            }
-            for (index in block * PER_BLOCK until block * PER_BLOCK + PER_BLOCK) {
-                columns[index] = a * templateColumns[index] + b
-            }
+        var blocks = detectBlocks(
+            model,
+            columnPeaks,
+            circles,
+            rows,
+            cellTolerance,
+            pitchScale,
+            columnPitch,
+            columnTolerance,
+            trace,
+        ) ?: return null
+        var columns = DoubleArray(blocks.size * PER_BLOCK) { index ->
+            blocks[index / PER_BLOCK][index % PER_BLOCK]
         }
         if (columns.any { !it.isFinite() }) return null
 
-        val matchedColumns = columns.count { column ->
-            columnPeaks.any { abs(it - column) <= columnTolerance }
+        // Rows per block: the last block may print only some of its fifteen rows.
+        var blockRows = IntArray(blocks.size) { rows.size }
+        var cellMatches = matchCells(circles, columns, rows, blockRows, cellTolerance)
+        blockRows = trimRows(cellMatches, blocks.size, rows.size)
+        // Blocks are printed left to right from the first one; the first block without
+        // printed rows ends the structure.
+        var blockCount = blockRows.indexOfFirst { it == 0 }.let { if (it < 0) blockRows.size else it }
+        if (blockCount == 0) return null
+        if (blockCount < blockRows.size) {
+            blockRows = blockRows.copyOf(blockCount)
+            columns = columns.copyOf(blockCount * PER_BLOCK)
         }
-        if (matchedColumns < 10) return null
-
-        val rows = DoubleArray(ROWS) { rowFit.a * templateRows[it] + rowFit.b }
-        val pitch = (rows[14] - rows[0]) / 14.0
-        if (pitch < 8.0 * unit) return null
-        val tolerance = max(3.0 * unit, pitch * 0.35)
-
-        // Anchor the lattice on the printed rings: the initial fit is linear, so a page
-        // warp that is slightly off leaves the whole pattern shifted. Two passes of
-        // match-then-snap move every column and row onto the median center of the
-        // circles matched to its own cells, which is what the reading and the answer
-        // box are drawn from.
-        var cellMatches = matchCells(circles, template, columns, rows, tolerance)
+        cellMatches = matchCells(circles, columns, rows, blockRows, cellTolerance)
         var snapped = snapLattice(cellMatches, columns, rows)
-        cellMatches = matchCells(circles, template, snapped.first, snapped.second, tolerance)
+        cellMatches = matchCells(circles, snapped.first, snapped.second, blockRows, cellTolerance)
         snapped = snapLattice(cellMatches, snapped.first, snapped.second)
         val finalColumns = snapped.first
         val finalRows = snapped.second
 
         val matched = cellMatches.size
-        val radiusSum = cellMatches.sumOf { it.circle.r }
-        val total = template.questions.sumOf { it.options.size }
         if (matched == 0) return null
-        val finalMatchedColumns = finalColumns.count { column ->
+        val radiusSum = cellMatches.sumOf { it.circle.r }
+        val matchedColumns = finalColumns.indices.count { column ->
+            cellMatches.count { it.column == column } >= 2
+        }
+        val finalMatchedColumnsByPeak = finalColumns.count { column ->
             columnPeaks.any { abs(it - column) <= columnTolerance }
         }
 
-        val expected = Array(COLUMNS) { BooleanArray(ROWS) }
-        for (question in template.questions) {
-            val block = (question.number - 1) / 15
-            val row = when {
-                question.number <= 15 -> question.number - 1
-                question.number <= 30 -> question.number - 16
-                else -> question.number - 31
-            }
-            for (index in 0 until 5) expected[block * 5 + index][row] = true
-        }
+        // Rings that sit in the rows band but outside the detected structure are foreign
+        // grid evidence: the partial block of an upside-down sheet, a structure shifted
+        // by a whole block, or the blank tail of a misdetected lattice. They are what
+        // tells a two-block sheet from a three-block one seen from the wrong side.
+        val bandTop = finalRows.min() - cellTolerance
+        val bandBottom = finalRows.max() + cellTolerance
         var extra = 0
         for (circle in circles) {
+            if (circle.y < bandTop || circle.y > bandBottom) continue
             val column = finalColumns.indices.minByOrNull { abs(finalColumns[it] - circle.x) } ?: continue
             val row = finalRows.indices.minByOrNull { abs(finalRows[it] - circle.y) } ?: continue
-            if (abs(finalColumns[column] - circle.x) > tolerance || abs(finalRows[row] - circle.y) > tolerance) continue
-            if (!expected[column][row]) extra++
+            val onColumn = abs(finalColumns[column] - circle.x) <= cellTolerance
+            val onRow = abs(finalRows[row] - circle.y) <= cellTolerance
+            val explained = onColumn && onRow && row < blockRows[column / PER_BLOCK]
+            if (!explained) extra++
         }
 
+        trace?.invoke(
+            String.format(
+                Locale.US,
+                "circles blocks=%d rows=%s matched=%d peaks=%d columns=%d",
+                blockCount,
+                blockRows.joinToString(","),
+                matched,
+                finalMatchedColumnsByPeak,
+                matchedColumns,
+            ),
+        )
         return Fit(
             columns = finalColumns,
             rows = finalRows,
+            blockRows = blockRows,
             radius = (radiusSum / matched).coerceIn(3.0, 40.0),
             matchedCells = matched,
-            totalCells = total,
             extraCells = extra,
-            matchedColumns = finalMatchedColumns,
+            matchedColumns = matchedColumns,
             matchedRows = rowFit.matched,
+            positionError = positionError(model, unit, finalRows, height),
         )
+    }
+
+    /**
+     * Finds the printed blocks, left to right, from the detected column peaks.
+     *
+     * A global offset places the template lattice on the peaks; every candidate block is
+     * then aligned inside that offset and accepted while it holds printed rows. A block
+     * whose peaks were not detected (a last block with only a few rows) still counts when
+     * its bubbles are there, which is why the linear template columns are checked as a
+     * fallback. Only when the template anchor finds nothing (a sheet laid out elsewhere)
+     * are the peaks split into runs separated by wide gaps and aligned on their own.
+     */
+    private fun detectBlocks(
+        model: Model,
+        columnPeaks: List<Double>,
+        circles: List<Circle>,
+        rows: DoubleArray,
+        cellTolerance: Double,
+        pitchScale: Double,
+        columnPitch: Double,
+        peakTolerance: Double,
+        trace: ((String) -> Unit)?,
+    ): List<DoubleArray>? {
+        val modelColumns = model.columns()
+        val globalOffset = voteOffset(columnPeaks, modelColumns, pitchScale, peakTolerance)
+        if (globalOffset != null) {
+            anchoredBlocks(model, columnPeaks, circles, rows, cellTolerance, pitchScale, columnPitch, peakTolerance, globalOffset, trace)
+                ?.let { return it }
+        }
+
+        // Rescue: split the peaks into runs separated by wide gaps and align each run.
+        val groups = ArrayList<MutableList<Double>>()
+        for (peak in columnPeaks) {
+            val group = groups.lastOrNull()
+            if (group != null && peak - group.last() <= 1.7 * columnPitch) {
+                group.add(peak)
+            } else {
+                groups.add(mutableListOf(peak))
+            }
+        }
+        val rescued = ArrayList<DoubleArray>(MAX_BLOCKS)
+        for (group in groups) {
+            if (group.size < 4) continue
+            val alignment = alignGroup(group, model.columnOffsets, pitchScale, columnPitch, peakTolerance, null)
+                ?: continue
+            val candidate = DoubleArray(PER_BLOCK) { alignment.a * model.columnOffsets[it] + alignment.b }
+            if (blockRowPresence(circles, candidate, rows, cellTolerance) == 0) continue
+            rescued.add(candidate)
+        }
+        rescued.sortBy { it.first() }
+        if (rescued.isEmpty() || rescued.size > MAX_BLOCKS) return null
+
+        // Anchor the rest of the sheet on the leftmost rescued block: the template offset
+        // is known once block one is placed, which recovers blocks whose peaks were lost.
+        val anchored = anchoredBlocks(
+            model,
+            columnPeaks,
+            circles,
+            rows,
+            cellTolerance,
+            pitchScale,
+            columnPitch,
+            peakTolerance,
+            rescued.first().first() - pitchScale * model.blockOrigins[0],
+            trace,
+        )
+        return if (anchored != null && anchored.size >= rescued.size) anchored else rescued
+    }
+
+    private fun anchoredBlocks(
+        model: Model,
+        columnPeaks: List<Double>,
+        circles: List<Circle>,
+        rows: DoubleArray,
+        cellTolerance: Double,
+        pitchScale: Double,
+        columnPitch: Double,
+        peakTolerance: Double,
+        globalOffset: Double,
+        trace: ((String) -> Unit)?,
+    ): List<DoubleArray>? {
+        val blocks = ArrayList<DoubleArray>(MAX_BLOCKS)
+        val span = pitchScale * model.columnOffsets.last()
+        for (block in 0 until MAX_BLOCKS) {
+            val expected = pitchScale * model.blockOrigins[block] + globalOffset
+            val group = columnPeaks.filter {
+                it >= expected - 0.75 * columnPitch && it <= expected + span + 0.75 * columnPitch
+            }
+            val alignment = alignGroup(group, model.columnOffsets, pitchScale, columnPitch, peakTolerance, expected)
+            val alignedCandidate = alignment?.let { aligned ->
+                DoubleArray(PER_BLOCK) { aligned.a * model.columnOffsets[it] + aligned.b }
+            }
+            // The peaks of this block were lost (a last block with few printed rows):
+            // fall back to the template columns and let the snap pass refine them.
+            val candidate = alignedCandidate
+                ?.takeIf { blockRowPresence(circles, it, rows, cellTolerance) > 0 }
+                ?: DoubleArray(PER_BLOCK) {
+                    pitchScale * (model.blockOrigins[block] + model.columnOffsets[it]) + globalOffset
+                }
+            val presentRows = blockRowPresence(circles, candidate, rows, cellTolerance)
+            if (trace != null) {
+                trace(
+                    String.format(
+                        Locale.US,
+                        "block %d peaks=%d rows=%d offset=%.1f",
+                        block,
+                        alignment?.matched ?: 0,
+                        presentRows,
+                        candidate[0],
+                    ),
+                )
+            }
+            if (presentRows == 0) break
+            blocks.add(candidate)
+        }
+        return blocks.ifEmpty { null }
     }
 
     private data class CellMatch(val column: Int, val row: Int, val circle: Circle)
 
-    /** Nearest printed circle within [tolerance] of every template cell. */
+    /** Nearest printed circle within [tolerance] of every expected cell. */
     private fun matchCells(
         circles: List<Circle>,
-        template: ExamTemplate,
         columns: DoubleArray,
         rows: DoubleArray,
+        blockRows: IntArray,
         tolerance: Double,
     ): List<CellMatch> {
         val matches = ArrayList<CellMatch>(columns.size * rows.size)
-        for (question in template.questions) {
-            val block = (question.number - 1) / 15
-            val row = when {
-                question.number <= 15 -> question.number - 1
-                question.number <= 30 -> question.number - 16
-                else -> question.number - 31
-            }
-            if (row !in rows.indices) continue
-            for (option in question.options) {
-                val letterIndex = LETTERS.indexOf(option.letter)
-                if (letterIndex < 0) continue
-                val column = block * 5 + letterIndex
-                if (column !in columns.indices) continue
-                val x = columns[column]
-                val y = rows[row]
-                val circle = circles.minByOrNull { (it.x - x) * (it.x - x) + (it.y - y) * (it.y - y) }
-                if (circle != null && abs(circle.x - x) <= tolerance && abs(circle.y - y) <= tolerance) {
-                    matches.add(CellMatch(column, row, circle))
+        for (block in blockRows.indices) {
+            for (row in 0 until blockRows[block].coerceAtMost(rows.size)) {
+                for (letter in 0 until PER_BLOCK) {
+                    val column = block * PER_BLOCK + letter
+                    val x = columns[column]
+                    val y = rows[row]
+                    val circle = circles.minByOrNull { (it.x - x) * (it.x - x) + (it.y - y) * (it.y - y) }
+                    if (circle != null && abs(circle.x - x) <= tolerance && abs(circle.y - y) <= tolerance) {
+                        matches.add(CellMatch(column, row, circle))
+                    }
                 }
             }
         }
         return matches
+    }
+
+    /**
+     * Rows printed per block. A row counts as printed when at least three of its five
+     * columns carry a detected ring. Every block prints its rows from the top, so a block
+     * whose first row is blank does not belong to the structure (it is the partial block
+     * seen upside down). Taking the last printed row instead of the first gap keeps the
+     * questions of a row whose rings the detector missed.
+     */
+    private fun trimRows(matches: List<CellMatch>, blockCount: Int, rowCount: Int): IntArray {
+        val counts = Array(blockCount) { IntArray(rowCount) }
+        for (match in matches) {
+            if (match.row in 0 until rowCount) counts[match.column / PER_BLOCK][match.row]++
+        }
+        return IntArray(blockCount) { block ->
+            var last = -1
+            for (row in 0 until rowCount) if (counts[block][row] >= 3) last = row
+            if (counts[block][0] < 3) 0 else last + 1
+        }
+    }
+
+    /** Number of rows of [columns] that carry at least three printed bubbles. */
+    private fun blockRowPresence(
+        circles: List<Circle>,
+        columns: DoubleArray,
+        rows: DoubleArray,
+        tolerance: Double,
+    ): Int {
+        var present = 0
+        for (rowY in rows) {
+            var matched = 0
+            for (x in columns) {
+                val circle = circles.minByOrNull { (it.x - x) * (it.x - x) + (it.y - rowY) * (it.y - rowY) }
+                if (circle != null && abs(circle.x - x) <= tolerance && abs(circle.y - rowY) <= tolerance) {
+                    matched++
+                }
+            }
+            if (matched >= 3) present++
+        }
+        return present
     }
 
     /**
@@ -449,16 +680,22 @@ object AnswerGrid {
     private data class BlockAlignment(val a: Double, val b: Double, val matched: Int)
 
     /** Average distance between two neighbouring columns inside a block of the template. */
-    private fun templatePitch(columns: DoubleArray): Double {
-        var sum = 0.0
-        var count = 0
-        for (block in 0 until BLOCKS) {
-            for (index in 1 until PER_BLOCK) {
-                sum += columns[block * PER_BLOCK + index] - columns[block * PER_BLOCK + index - 1]
-                count++
-            }
-        }
-        return if (count == 0) 1.0 else sum / count
+    private fun offsetsPitch(offsets: DoubleArray): Double =
+        if (offsets.size < 2) 1.0 else (offsets.last() - offsets.first()) / (offsets.size - 1)
+
+    private fun rowPitch(rows: DoubleArray): Double =
+        if (rows.size < 2) 0.0 else (rows.last() - rows.first()) / (rows.size - 1)
+
+    /**
+     * Vertical distance between the fitted rows and the page position the template
+     * expects, as a fraction of the page height. Used only to break orientation ties:
+     * the answer grid always sits below the instructions, never in the upper half.
+     */
+    private fun positionError(model: Model, unit: Double, rows: DoubleArray, height: Int): Double {
+        if (rows.isEmpty() || height <= 0) return 0.0
+        val expected = unit * (model.templateRows.first() + model.templateRows.last()) / 2.0
+        val actual = (rows.first() + rows.last()) / 2.0
+        return abs(actual - expected) / height
     }
 
     private fun medianGap(peaks: List<Double>): Double? {
@@ -472,35 +709,32 @@ object AnswerGrid {
     /**
      * Aligns one block of five template columns to the peaks around that block.
      *
-     * The scale is fixed (it comes from the printed pitch) and only the offset is searched
-     * near the expected position, so a missing or stray peak cannot drag the block by a
-     * whole column, which is the failure mode of a plain global least-squares fit.
+     * The scale is fixed (it comes from the printed pitch) and only the offset is searched,
+     * so a missing or stray peak cannot drag the block by a whole column, which is the
+     * failure mode of a plain global least-squares fit.
      */
     private fun alignGroup(
         peaks: List<Double>,
-        model: DoubleArray,
-        block: Int,
+        offsets: DoubleArray,
         scale: Double,
         pitch: Double,
         tolerance: Double,
-        expectedOffset: Double,
+        expectedOffset: Double?,
     ): BlockAlignment? {
         if (peaks.size < 2) return null
-        val firstIndex = block * PER_BLOCK
-        val modelBlock = DoubleArray(PER_BLOCK) { model[firstIndex + it] }
         val offsetLimit = 0.6 * pitch
         var bestOffset = Double.NaN
         var bestCount = 0
         var bestResidual = Double.MAX_VALUE
         for (peak in peaks) {
             for (index in 0 until PER_BLOCK) {
-                val offset = peak - scale * modelBlock[index]
-                if (abs(offset - expectedOffset) > offsetLimit) continue
-                val pairs = matchPairs(peaks, modelBlock, scale, offset, tolerance)
+                val offset = peak - scale * offsets[index]
+                if (expectedOffset != null && abs(offset - expectedOffset) > offsetLimit) continue
+                val pairs = matchPairs(peaks, offsets, scale, offset, tolerance)
                 if (pairs.size < 2) continue
                 var residual = 0.0
                 for ((modelIndex, peakIndex) in pairs) {
-                    val distance = peaks[peakIndex] - (scale * modelBlock[modelIndex] + offset)
+                    val distance = peaks[peakIndex] - (scale * offsets[modelIndex] + offset)
                     residual += distance * distance
                 }
                 if (pairs.size > bestCount || (pairs.size == bestCount && residual < bestResidual)) {
@@ -512,11 +746,11 @@ object AnswerGrid {
         }
         if (bestCount < 2) return null
 
-        val pairs = matchPairs(peaks, modelBlock, scale, bestOffset, tolerance)
+        val pairs = matchPairs(peaks, offsets, scale, bestOffset, tolerance)
         val xs = ArrayList<Double>(pairs.size)
         val us = ArrayList<Double>(pairs.size)
         for ((modelIndex, peakIndex) in pairs) {
-            xs.add(modelBlock[modelIndex])
+            xs.add(offsets[modelIndex])
             us.add(peaks[peakIndex])
         }
         val refined = leastSquares(xs, us)
@@ -594,65 +828,54 @@ object AnswerGrid {
 
     fun read(
         gray: Mat,
-        template: ExamTemplate,
         fit: Fit,
     ): List<OutcomeAnswer> {
         val height = gray.rows()
         val width = gray.cols()
-        val filled = Mat()
-        Imgproc.threshold(
-            gray,
-            filled,
-            max(1.0, otsuThreshold(gray) - 18.0),
-            255.0,
-            Imgproc.THRESH_BINARY_INV,
-        )
-        val integral = Mat()
-        Imgproc.integral(filled, integral, CvType.CV_32S)
-        val stride = integral.cols()
-        val data = IntArray(integral.rows() * stride)
-        integral.get(0, 0, data)
-        integral.release()
-        filled.release()
+        val pixels = ByteArray(width * height)
+        gray.get(0, 0, pixels)
 
         // Small disc: stays clear of the printed ring's ink, so an empty bubble reads
-        // near zero while a pen blob fills it almost completely.
+        // near zero while a pen mark fills a good part of it.
         val kernel = discKernel(max(3, (fit.radius * 0.55).roundToInt()))
-        val answers = ArrayList<OutcomeAnswer>(template.questions.size)
-        for (question in template.questions) {
-            val block = (question.number - 1) / 15
-            val row = when {
-                question.number <= 15 -> question.number - 1
-                question.number <= 30 -> question.number - 16
-                else -> question.number - 31
-            }
-            var bestLetter = ""
-            var bestRatio = 0.0
-            var secondRatio = 0.0
-            for (option in question.options) {
-                val letterIndex = LETTERS.indexOf(option.letter)
-                if (letterIndex < 0) continue
-                val cx = fit.columns[block * 5 + letterIndex].roundToInt()
+        val answers = ArrayList<OutcomeAnswer>(fit.totalCells / PER_BLOCK)
+        for (block in fit.blockRows.indices) {
+            for (row in 0 until fit.blockRows[block]) {
                 val cy = fit.rows[row].roundToInt()
-                val ratio = discFill(data, stride, width, height, cx, cy, kernel)
-                if (ratio > bestRatio) {
-                    secondRatio = bestRatio
-                    bestRatio = ratio
-                    bestLetter = option.letter.toString()
-                } else if (ratio > secondRatio) {
-                    secondRatio = ratio
+                val centers = IntArray(PER_BLOCK) { letter ->
+                    fit.columns[block * PER_BLOCK + letter].roundToInt()
                 }
+                // The five bubbles of a question share a row, so their typical tone is the
+                // paper level right there. A soft shadow or a darker corner of the page
+                // moves that baseline with them, which one global threshold cannot do.
+                val paper = median(
+                    centers.map { discMean(pixels, width, height, it, cy, kernel) }.filter { it >= 0.0 },
+                )
+                val inkThreshold = paper - max(MIN_INK_MARGIN, INK_MARGIN * paper)
+                var bestLetter = ""
+                var bestRatio = 0.0
+                var secondRatio = 0.0
+                for (letter in 0 until PER_BLOCK) {
+                    val ratio = discInk(pixels, width, height, centers[letter], cy, inkThreshold, kernel)
+                    if (ratio > bestRatio) {
+                        secondRatio = bestRatio
+                        bestRatio = ratio
+                        bestLetter = LETTERS[letter].toString()
+                    } else if (ratio > secondRatio) {
+                        secondRatio = ratio
+                    }
+                }
+                val ambiguous = bestRatio >= 0.42 && secondRatio >= 0.32
+                answers.add(
+                    OutcomeAnswer(
+                        number = block * QUESTIONS_PER_BLOCK + row + 1,
+                        letter = if (bestRatio >= 0.42) bestLetter else "",
+                        ratio = bestRatio,
+                        secondRatio = secondRatio,
+                        ambiguous = ambiguous,
+                    ),
+                )
             }
-            val ambiguous = bestRatio >= 0.42 && secondRatio >= 0.32
-            answers.add(
-                OutcomeAnswer(
-                    number = question.number,
-                    letter = if (bestRatio >= 0.42) bestLetter else "",
-                    ratio = bestRatio,
-                    secondRatio = secondRatio,
-                    ambiguous = ambiguous,
-                ),
-            )
         }
         return answers
     }
@@ -669,14 +892,16 @@ object AnswerGrid {
         integral.get(0, 0, data)
         integral.release()
         val ring = ringKernel(radius)
-        val values = ArrayList<Double>(COLUMNS * ROWS)
-        for (column in 0 until COLUMNS) {
-            for (row in 0 until ROWS) {
-                val cx = fit.columns[column].roundToInt()
-                val cy = fit.rows[row].roundToInt()
-                val mean = boxMean(data, stride, width, height, cx, cy, ring)
-                if (mean < 0.0) continue
-                values.add(mean)
+        val values = ArrayList<Double>(fit.totalCells)
+        for (block in fit.blockRows.indices) {
+            for (row in 0 until fit.blockRows[block]) {
+                for (letter in 0 until PER_BLOCK) {
+                    val cx = fit.columns[block * PER_BLOCK + letter].roundToInt()
+                    val cy = fit.rows[row].roundToInt()
+                    val mean = boxMean(data, stride, width, height, cx, cy, ring)
+                    if (mean < 0.0) continue
+                    values.add(mean)
+                }
             }
         }
         if (values.isEmpty()) return 0.0
@@ -909,16 +1134,6 @@ object AnswerGrid {
         return found
     }
 
-    private fun otsuThreshold(gray: Mat): Double {
-        val blurred = Mat()
-        Imgproc.GaussianBlur(gray, blurred, Size(5.0, 5.0), 0.0)
-        val binary = Mat()
-        val value = Imgproc.threshold(blurred, binary, 0.0, 255.0, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU)
-        blurred.release()
-        binary.release()
-        return value
-    }
-
     private data class KernelRow(val dy: Int, val segments: List<IntArray>)
     private data class Kernel(val rows: List<KernelRow>, val area: Int)
 
@@ -956,18 +1171,53 @@ object AnswerGrid {
         return Kernel(rows, max(1, area))
     }
 
-    private fun discFill(
-        data: IntArray,
-        stride: Int,
+    /** Mean gray of the disc, or -1 when it does not fit on the page. */
+    private fun discMean(
+        pixels: ByteArray,
         width: Int,
         height: Int,
         centerX: Int,
         centerY: Int,
         kernel: Kernel,
     ): Double {
-        val mean = boxMean(data, stride, width, height, centerX, centerY, kernel)
-        if (mean < 0.0) return 0.0
-        return mean / 255.0
+        var sum = 0L
+        for (row in kernel.rows) {
+            val y = centerY + row.dy
+            if (y < 0 || y >= height) return -1.0
+            val base = y * width
+            for (segment in row.segments) {
+                val x0 = centerX + segment[0]
+                val x1 = centerX + segment[1]
+                if (x0 < 0 || x1 >= width) return -1.0
+                for (x in x0..x1) sum += (pixels[base + x].toInt() and 0xFF).toLong()
+            }
+        }
+        return sum.toDouble() / kernel.area
+    }
+
+    /** Fraction of the disc whose pixels are darker than [threshold]. */
+    private fun discInk(
+        pixels: ByteArray,
+        width: Int,
+        height: Int,
+        centerX: Int,
+        centerY: Int,
+        threshold: Double,
+        kernel: Kernel,
+    ): Double {
+        var dark = 0
+        for (row in kernel.rows) {
+            val y = centerY + row.dy
+            if (y < 0 || y >= height) return 0.0
+            val base = y * width
+            for (segment in row.segments) {
+                val x0 = centerX + segment[0]
+                val x1 = centerX + segment[1]
+                if (x0 < 0 || x1 >= width) return 0.0
+                for (x in x0..x1) if ((pixels[base + x].toInt() and 0xFF) < threshold) dark++
+            }
+        }
+        return dark.toDouble() / kernel.area
     }
 
     private fun boxMean(

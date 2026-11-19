@@ -20,6 +20,8 @@ export type ScanResult = {
   coverage: number;
   pageAreaRatio: number;
   orientation: number;
+  /** Printed blocks (A-E groups) found on the sheet: 1 to 6. */
+  blocks: number;
   elapsedMs: number;
   answers: ScanAnswer[];
   warnings: string[];

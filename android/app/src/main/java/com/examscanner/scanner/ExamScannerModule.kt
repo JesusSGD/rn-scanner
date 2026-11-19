@@ -83,6 +83,7 @@ class ExamScannerModule(private val reactContext: ReactApplicationContext) :
         putDouble("coverage", coverage)
         putDouble("pageAreaRatio", pageAreaRatio)
         putInt("orientation", orientation)
+        putInt("blocks", blocks)
         putDouble("elapsedMs", elapsedMs.toDouble())
         val answerArray = Arguments.createArray()
         for (answer in answers) {

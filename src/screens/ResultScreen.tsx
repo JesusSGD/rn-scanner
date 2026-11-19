@@ -42,6 +42,12 @@ export default function ResultScreen({result, onRetry}: Props) {
               <Text style={styles.summaryLabel}>
                 {total === 1 ? 'respuesta marcada' : 'respuestas marcadas'}
               </Text>
+              {result.blocks > 0 ? (
+                <Text style={styles.summaryDetail}>
+                  {result.blocks}{' '}
+                  {result.blocks === 1 ? 'bloque A-E' : 'bloques A-E'}
+                </Text>
+              ) : null}
             </View>
 
             {answered.length > 0 ? (
@@ -159,6 +165,11 @@ const styles = StyleSheet.create({
   summaryLabel: {
     color: '#9aa4af',
     fontSize: 14,
+  },
+  summaryDetail: {
+    color: '#6e7681',
+    fontSize: 12,
+    marginTop: 4,
   },
   grid: {
     flexDirection: 'row',

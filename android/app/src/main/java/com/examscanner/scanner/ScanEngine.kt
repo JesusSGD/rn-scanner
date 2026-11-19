@@ -20,8 +20,9 @@ object ScanEngine {
     // loses the lattice and fails the coverage gate, which is the better message.
     private const val MAX_BRIGHTNESS = 255.0
     private const val MAX_GLARE = 0.90
-    // 130/165 cells with 14 of 15 columns is a solid fit on a blurry desk photo; the
-    // remaining cells' positions come from the fitted lattice itself.
+    // 125/165 cells is a solid fit on a blurry desk photo; the remaining cells'
+    // positions come from the fitted lattice itself. The gate is a fraction because
+    // the sheet may print one to six blocks with a partial last block.
     private const val MIN_COVERAGE = 0.75
     private const val MIN_RING_STRENGTH = 12.0
     private const val ORIENTATION_SCALE = 0.75
@@ -61,8 +62,10 @@ object ScanEngine {
         trace?.invoke(String.format(Locale.US, "page area=%.3f", pageAreaRatio))
 
         // Pick the page orientation before paying for a full-resolution fit. Evaluation
-        // halves keep the loop cheap, and the asymmetry of the printed grid (the third
-        // block only has three rows) makes the right orientation win by a wide margin.
+        // halves keep the loop cheap, and the asymmetry of the printed grid (the last
+        // block may print only a few rows) makes the right orientation win by a wide
+        // margin. A decisive fit ends the search early: full coverage, no foreign rings
+        // and the grid where the sheet template puts it.
         var bestRotation = -1
         var bestScore = 0.0
         for (rotation in 0 until 4) {
@@ -75,13 +78,14 @@ object ScanEngine {
                 trace(
                     String.format(
                         Locale.US,
-                        "rot=%d cells=%d/%d extra=%d cols=%d rows=%d radius=%.1f score=%.1f",
+                        "rot=%d cells=%d/%d extra=%d cols=%d rows=%d blocks=%d radius=%.1f score=%.1f",
                         rotation,
                         fit.matchedCells,
                         fit.totalCells,
                         fit.extraCells,
                         fit.matchedColumns,
                         fit.matchedRows,
+                        fit.blockRows.size,
                         fit.radius,
                         score,
                     ),
@@ -91,7 +95,10 @@ object ScanEngine {
                 bestRotation = rotation
                 bestScore = score
             }
-            if (bestRotation >= 0 && bestScore >= 165.0) break
+            // A decisive fit ends the search early; foreign rings mean the lattice is
+            // explaining only part of the page, and a grid far from the template's page
+            // position means the sheet is probably being read upside down.
+            if (fit != null && fit.coverage >= 0.9 && fit.extraCells == 0 && fit.positionError < 0.05) break
         }
         val rotation = if (bestRotation >= 0) bestRotation else 0
 
@@ -183,14 +190,15 @@ object ScanEngine {
                 coverage = 0.0,
                 pageAreaRatio = pageAreaRatio,
                 orientation = rotation,
+                blocks = 0,
                 elapsedMs = elapsed(),
             )
         }
 
-        val answers = AnswerGrid.read(warp, template, fit)
+        val answers = AnswerGrid.read(warp, fit)
 
         val warnings = ArrayList<String>()
-        if (fit.matchedColumns < 15 || fit.matchedRows < 15) {
+        if (fit.matchedColumns < fit.columns.size || fit.matchedRows < fit.rows.size) {
             warnings.add("Algunas burbujas no se detectaron; revisa las marcas dudosas.")
         }
         val ambiguous = answers.filter { it.ambiguous }
@@ -207,7 +215,7 @@ object ScanEngine {
 
         val ok = reasons.isEmpty()
         val debugPath = if (debugFile != null) {
-            writeDebug(warp, fit, template, answers, debugFile)
+            writeDebug(warp, fit, answers, debugFile)
         } else {
             null
         }
@@ -229,6 +237,7 @@ object ScanEngine {
             coverage = fit.coverage,
             pageAreaRatio = pageAreaRatio,
             orientation = rotation,
+            blocks = fit.blockRows.size,
             elapsedMs = elapsed(),
             debugPath = debugPath,
         )
@@ -267,7 +276,6 @@ object ScanEngine {
     private fun writeDebug(
         warp: Mat,
         fit: AnswerGrid.Fit,
-        template: ExamTemplate,
         answers: List<OutcomeAnswer>,
         file: File,
     ): String? = try {
@@ -276,15 +284,20 @@ object ScanEngine {
         Imgproc.cvtColor(warp, debug, Imgproc.COLOR_GRAY2BGR)
         val answerByNumber = answers.associateBy { it.number }
         val patternStroke = max(2, (fit.radius * 0.3).roundToInt())
-        for (column in fit.columns.indices) {
-            for (row in fit.rows.indices) {
-                Imgproc.circle(
-                    debug,
-                    Point(fit.columns[column], fit.rows[row]),
-                    max(2, (fit.radius * 0.8).roundToInt()),
-                    Scalar(255.0, 190.0, 115.0),
-                    patternStroke,
-                )
+        for (block in fit.blockRows.indices) {
+            for (row in 0 until fit.blockRows[block]) {
+                for (letter in 0 until AnswerGrid.PER_BLOCK) {
+                    Imgproc.circle(
+                        debug,
+                        Point(
+                            fit.columns[block * AnswerGrid.PER_BLOCK + letter],
+                            fit.rows[row],
+                        ),
+                        max(2, (fit.radius * 0.8).roundToInt()),
+                        Scalar(255.0, 190.0, 115.0),
+                        patternStroke,
+                    )
+                }
             }
         }
 
@@ -312,45 +325,41 @@ object ScanEngine {
             3,
         )
 
-        for (question in template.questions) {
-            val answer = answerByNumber[question.number]
-            val block = (question.number - 1) / 15
-            val row = when {
-                question.number <= 15 -> question.number - 1
-                question.number <= 30 -> question.number - 16
-                else -> question.number - 31
-            }
-            for ((index, option) in question.options.withIndex()) {
-                val x = fit.columns[block * 5 + index]
-                val y = fit.rows[row]
-                val color = when {
-                    answer == null -> Scalar(0.0, 0.0, 255.0)
-                    option.letter.toString() == answer.letter -> Scalar(0.0, 220.0, 0.0)
-                    else -> Scalar(170.0, 170.0, 170.0)
-                }
-                Imgproc.circle(
-                    debug,
-                    Point(x, y),
-                    max(3, (fit.radius * 0.8).roundToInt()),
-                    color,
-                    1,
-                )
-            }
-            if (answer != null && answer.letter.isNotEmpty()) {
-                val index = "ABCDE".indexOf(answer.letter)
-                if (index >= 0) {
-                    Imgproc.putText(
+        for (block in fit.blockRows.indices) {
+            for (row in 0 until fit.blockRows[block]) {
+                val answer = answerByNumber[block * AnswerGrid.QUESTIONS_PER_BLOCK + row + 1]
+                for (letter in 0 until AnswerGrid.PER_BLOCK) {
+                    val x = fit.columns[block * AnswerGrid.PER_BLOCK + letter]
+                    val y = fit.rows[row]
+                    val color = when {
+                        answer == null -> Scalar(0.0, 0.0, 255.0)
+                        AnswerGrid.LETTERS[letter].toString() == answer.letter -> Scalar(0.0, 220.0, 0.0)
+                        else -> Scalar(170.0, 170.0, 170.0)
+                    }
+                    Imgproc.circle(
                         debug,
-                        answer.letter,
-                        Point(
-                            fit.columns[block * 5 + index] + fit.radius + 2,
-                            fit.rows[row] + 5,
-                        ),
-                        Imgproc.FONT_HERSHEY_SIMPLEX,
-                        0.45,
-                        Scalar(0.0, 200.0, 0.0),
+                        Point(x, y),
+                        max(3, (fit.radius * 0.8).roundToInt()),
+                        color,
                         1,
                     )
+                }
+                if (answer != null && answer.letter.isNotEmpty()) {
+                    val index = AnswerGrid.LETTERS.indexOf(answer.letter)
+                    if (index >= 0) {
+                        Imgproc.putText(
+                            debug,
+                            answer.letter,
+                            Point(
+                                fit.columns[block * AnswerGrid.PER_BLOCK + index] + fit.radius + 2,
+                                fit.rows[row] + 5,
+                            ),
+                            Imgproc.FONT_HERSHEY_SIMPLEX,
+                            0.45,
+                            Scalar(0.0, 200.0, 0.0),
+                            1,
+                        )
+                    }
                 }
             }
         }
@@ -382,6 +391,7 @@ object ScanEngine {
         coverage = 0.0,
         pageAreaRatio = pageAreaRatio,
         orientation = 0,
+        blocks = 0,
         elapsedMs = elapsedMs,
     )
 }

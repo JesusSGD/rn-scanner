@@ -77,6 +77,8 @@ data class ScanOutcome(
     val coverage: Double,
     val pageAreaRatio: Double,
     val orientation: Int,
+    /** Printed blocks (A-E groups) found on the sheet: 1 to 6. */
+    val blocks: Int,
     val elapsedMs: Long,
     val debugPath: String? = null,
     val error: String? = null,
