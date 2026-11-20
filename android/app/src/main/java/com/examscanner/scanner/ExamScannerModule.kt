@@ -98,6 +98,7 @@ class ExamScannerModule(private val reactContext: ReactApplicationContext) :
             )
         }
         putArray("answers", answerArray)
+        qr?.let { putString("qr", it) }
         val warningArray = Arguments.createArray()
         for (warning in warnings) warningArray.pushString(warning)
         putArray("warnings", warningArray)

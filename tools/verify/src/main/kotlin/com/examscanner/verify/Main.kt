@@ -12,21 +12,40 @@ import java.util.Locale
 private fun fmt(value: Double, pattern: String): String =
     String.format(Locale.US, pattern, value)
 
+/** JSON string literal, so decoded QR content can be printed safely. */
+private fun jsonString(value: String): String {
+    val out = StringBuilder("\"")
+    for (char in value) {
+        when (char) {
+            '"' -> out.append("\\\"")
+            '\\' -> out.append("\\\\")
+            '\n' -> out.append("\\n")
+            '\r' -> out.append("\\r")
+            '\t' -> out.append("\\t")
+            else -> if (char < ' ') out.append(String.format(Locale.US, "\\u%04x", char.code)) else out.append(char)
+        }
+    }
+    return out.append('"').toString()
+}
+
 private fun jsonOutcome(outcome: ScanOutcome): String {
     val answers = outcome.answers.joinToString(",") { answer ->
         """{"number":${answer.number},"letter":"${answer.letter}","ratio":${fmt(answer.ratio, "%.3f")},"second":${fmt(answer.secondRatio, "%.3f")},"ambiguous":${answer.ambiguous}}"""
     }
-    return """{"ok":${outcome.ok},"reason":"${outcome.reason}","pageFound":${outcome.pageFound},"gridFound":${outcome.gridFound},"sharpness":${fmt(outcome.sharpness, "%.1f")},"brightness":${fmt(outcome.brightness, "%.1f")},"glare":${fmt(outcome.glare, "%.3f")},"lattice":${fmt(outcome.latticeScore, "%.1f")},"coverage":${fmt(outcome.coverage, "%.3f")},"area":${fmt(outcome.pageAreaRatio, "%.3f")},"orientation":${outcome.orientation},"blocks":${outcome.blocks},"ms":${outcome.elapsedMs},"warnings":${outcome.warnings.size},"answers":[$answers]}"""
+    return """{"ok":${outcome.ok},"reason":"${outcome.reason}","pageFound":${outcome.pageFound},"gridFound":${outcome.gridFound},"sharpness":${fmt(outcome.sharpness, "%.1f")},"brightness":${fmt(outcome.brightness, "%.1f")},"glare":${fmt(outcome.glare, "%.3f")},"lattice":${fmt(outcome.latticeScore, "%.1f")},"coverage":${fmt(outcome.coverage, "%.3f")},"area":${fmt(outcome.pageAreaRatio, "%.3f")},"orientation":${outcome.orientation},"blocks":${outcome.blocks},"ms":${outcome.elapsedMs},"warnings":${outcome.warnings.size},"qr":${outcome.qr?.let(::jsonString) ?: "null"},"answers":[$answers]}"""
 }
 
 private fun answerLine(outcome: ScanOutcome): String =
     outcome.answers.joinToString(" ") { "${it.number}:${if (it.letter.isEmpty()) "." else it.letter}" }
 
-/** A real capture with its hand-checked answers. */
+/** A real capture with its hand-checked answers and optional QR expectation. */
 private data class RealCase(
-    val file: String,
+    val file: File,
     val blocks: Int,
     val answered: Map<Int, String>,
+    val qr: String? = null,
+    /** A case kept outside the repo (a large sample photo) may be absent. */
+    val optional: Boolean = false,
 )
 
 private fun scanFile(file: File, template: ExamTemplate, debug: Boolean, trace: Boolean): ScanOutcome {
@@ -72,7 +91,7 @@ fun main(args: Array<String>) {
                     "area=${String.format(Locale.US, "%.2f", outcome.pageAreaRatio)} " +
                     "sharp=${String.format(Locale.US, "%.0f", outcome.sharpness)} " +
                     "bright=${String.format(Locale.US, "%.0f", outcome.brightness)} " +
-                    "ms=${outcome.elapsedMs} ans=[$answers]",
+                    "ms=${outcome.elapsedMs} qr=${outcome.qr ?: "(none)"} ans=[$answers]",
             )
         }
         return
@@ -84,15 +103,28 @@ fun main(args: Array<String>) {
 
     // 1. Real captures. Ground truth checked by hand against the photos.
     val realCases = listOf(
-        RealCase("test2.jpeg", blocks = 3, answered = mapOf(1 to "D")),
-        RealCase("test3.jpeg", blocks = 2, answered = mapOf(1 to "A", 2 to "B", 3 to "B")),
+        RealCase(File(fixturesDir, "test2.jpeg"), blocks = 3, answered = mapOf(1 to "D")),
+        RealCase(File(fixturesDir, "test3.jpeg"), blocks = 2, answered = mapOf(1 to "A", 2 to "B", 3 to "B")),
+        RealCase(
+            File(root, "example/test qr.jpg"),
+            blocks = 2,
+            answered = mapOf(1 to "A", 2 to "B", 3 to "B"),
+            qr = """{"usuario_curso":11587205,"prueba":199,"curso":620037,"sesion":"939","redaccion":0,"forma":"A"}""",
+            optional = true,
+        ),
     )
+    var realRan = 0
     for (case in realCases) {
-        val photo = File(fixturesDir, case.file)
+        val photo = case.file
         if (!photo.exists()) {
-            failures.add("${case.file}: missing")
+            if (case.optional) {
+                println("${photo.nameWithoutExtension}: skipped (optional, not present)")
+                continue
+            }
+            failures.add("${photo.name}: missing")
             continue
         }
+        realRan++
         val label = photo.nameWithoutExtension
         val photoImage: Mat = Imgcodecs.imread(photo.absolutePath, Imgcodecs.IMREAD_GRAYSCALE)
         check(!photoImage.empty()) { "Could not decode image: $photo" }
@@ -115,6 +147,7 @@ fun main(args: Array<String>) {
 
         println("$label ${jsonOutcome(outcome)}")
         println("$label answers ${answerLine(outcome)}")
+        println("$label qr ${outcome.qr ?: "(none)"}")
         if (!outcome.ok) failures.add("$label: expected ok, got ${outcome.reason}")
         for ((number, letter) in case.answered) {
             val got = outcome.answers.firstOrNull { it.number == number }?.letter
@@ -125,6 +158,9 @@ fun main(args: Array<String>) {
             failures.add("$label: expected ${case.answered.size} answered, got $answered (${answerLine(outcome)})")
         }
         if (outcome.blocks != case.blocks) failures.add("$label: expected ${case.blocks} blocks, got ${outcome.blocks}")
+        if (case.qr != null && outcome.qr != case.qr) {
+            failures.add("$label: expected qr ${jsonString(case.qr)}, got ${outcome.qr?.let(::jsonString) ?: "null"}")
+        }
     }
 
     // 2. Synthetic fixtures: the rectified sheet pasted on a desk, rotated and degraded.
@@ -162,7 +198,7 @@ fun main(args: Array<String>) {
         println("fixtures skipped: ${rectified.name} not found")
     }
     if (failures.isEmpty()) {
-        println("PASS real=${realCases.size} fixtures")
+        println("PASS real=$realRan fixtures")
     } else {
         failures.forEach { println("FAIL $it") }
         kotlin.system.exitProcess(1)

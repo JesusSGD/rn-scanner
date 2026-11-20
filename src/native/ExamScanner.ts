@@ -25,6 +25,8 @@ export type ScanResult = {
   elapsedMs: number;
   answers: ScanAnswer[];
   warnings: string[];
+  /** Content of the QR code printed in the sheet header, when it could be read. */
+  qr?: string;
   debugPath?: string;
 };
 

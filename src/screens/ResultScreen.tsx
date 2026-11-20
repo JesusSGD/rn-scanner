@@ -69,6 +69,15 @@ export default function ResultScreen({result, onRetry}: Props) {
                 No se detectó ninguna burbuja rellena.
               </Text>
             )}
+
+            {result.qr ? (
+              <View style={styles.qrCard}>
+                <Text style={styles.qrLabel}>Código QR de la hoja</Text>
+                <Text style={styles.qrValue} selectable>
+                  {result.qr}
+                </Text>
+              </View>
+            ) : null}
           </>
         ) : null}
 
@@ -206,6 +215,28 @@ const styles = StyleSheet.create({
     color: '#8b949e',
     fontSize: 15,
     textAlign: 'center',
+  },
+  qrCard: {
+    alignSelf: 'stretch',
+    marginTop: 24,
+    backgroundColor: '#161b22',
+    borderWidth: 1,
+    borderColor: '#30363d',
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  qrLabel: {
+    color: '#8b949e',
+    fontSize: 12,
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+    marginBottom: 6,
+  },
+  qrValue: {
+    color: '#f0f6fc',
+    fontSize: 15,
+    lineHeight: 22,
   },
   warnings: {
     marginTop: 24,

@@ -1,6 +1,7 @@
 package com.examscanner.scanner
 
 import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
 import org.opencv.core.MatOfPoint2f
 import org.opencv.core.Point
 import org.opencv.core.Scalar
@@ -214,8 +215,11 @@ object ScanEngine {
         }
 
         val ok = reasons.isEmpty()
+        // The result screen only shows the code on a good scan, so a rejected photo
+        // should not pay for the decode attempts.
+        val qr = if (ok) QrReader.read(warp) else null
         val debugPath = if (debugFile != null) {
-            writeDebug(warp, fit, answers, debugFile)
+            writeDebug(warp, fit, answers, qr, debugFile)
         } else {
             null
         }
@@ -240,6 +244,7 @@ object ScanEngine {
             blocks = fit.blockRows.size,
             elapsedMs = elapsed(),
             debugPath = debugPath,
+            qr = qr?.text,
         )
     }
 
@@ -265,7 +270,7 @@ object ScanEngine {
             warped,
             matrix,
             Size(width.toDouble(), height.toDouble()),
-            Imgproc.INTER_LINEAR,
+            Imgproc.INTER_CUBIC,
         )
         matrix.release()
         source.release()
@@ -277,6 +282,7 @@ object ScanEngine {
         warp: Mat,
         fit: AnswerGrid.Fit,
         answers: List<OutcomeAnswer>,
+        qr: QrReader.Result?,
         file: File,
     ): String? = try {
         file.parentFile?.mkdirs()
@@ -363,6 +369,30 @@ object ScanEngine {
                 }
             }
         }
+        // QR quad: shows which code was decoded, in page pixels.
+        val corners = qr?.corners
+        if (corners != null && corners.size == 4) {
+            val quad = MatOfPoint(*corners.toTypedArray())
+            Imgproc.polylines(
+                debug,
+                listOf(quad),
+                true,
+                Scalar(0.0, 230.0, 230.0),
+                max(2, (fit.radius * 0.35).roundToInt()),
+            )
+            quad.release()
+            val anchor = corners.minByOrNull { it.y } ?: corners[0]
+            Imgproc.putText(
+                debug,
+                "QR",
+                Point(anchor.x, max(12.0, anchor.y - 6.0)),
+                Imgproc.FONT_HERSHEY_SIMPLEX,
+                max(0.6, fit.radius / 14.0),
+                Scalar(0.0, 230.0, 230.0),
+                2,
+            )
+        }
+
         Imgcodecs.imwrite(file.absolutePath, debug)
         debug.release()
         file.absolutePath

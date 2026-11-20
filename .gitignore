@@ -66,6 +66,9 @@ yarn-error.log
 # testing
 /coverage
 
+# Large sample captures kept locally (the native harness skips them when absent)
+/example/
+
 # Yarn
 .yarn/*
 !.yarn/patches

@@ -82,4 +82,6 @@ data class ScanOutcome(
     val elapsedMs: Long,
     val debugPath: String? = null,
     val error: String? = null,
+    /** Content of the QR code printed in the sheet header, when one was found. */
+    val qr: String? = null,
 )

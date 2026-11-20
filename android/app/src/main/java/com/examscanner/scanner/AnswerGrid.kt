@@ -35,6 +35,10 @@ object AnswerGrid {
     // question row, because exposure and shadows drift across a photographed page.
     private const val INK_MARGIN = 0.10
     private const val MIN_INK_MARGIN = 12.0
+    // Share of the central disc that must be darker than the paper to call a mark.
+    // Faint pen strokes fill roughly a third of it; empty bubbles stay under a quarter.
+    private const val MARK_RATIO = 0.30
+    private const val AMBIGUOUS_SECOND = 0.24
 
     data class Fit(
         /** One x coordinate per option column: block * [PER_BLOCK] + letter. */
@@ -865,11 +869,11 @@ object AnswerGrid {
                         secondRatio = ratio
                     }
                 }
-                val ambiguous = bestRatio >= 0.42 && secondRatio >= 0.32
+                val ambiguous = bestRatio >= MARK_RATIO && secondRatio >= AMBIGUOUS_SECOND
                 answers.add(
                     OutcomeAnswer(
                         number = block * QUESTIONS_PER_BLOCK + row + 1,
-                        letter = if (bestRatio >= 0.42) bestLetter else "",
+                        letter = if (bestRatio >= MARK_RATIO) bestLetter else "",
                         ratio = bestRatio,
                         secondRatio = secondRatio,
                         ambiguous = ambiguous,
