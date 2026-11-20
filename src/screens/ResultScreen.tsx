@@ -70,14 +70,16 @@ export default function ResultScreen({result, onRetry}: Props) {
               </Text>
             )}
 
-            {result.qr ? (
-              <View style={styles.qrCard}>
-                <Text style={styles.qrLabel}>Código QR de la hoja</Text>
+            <View style={styles.qrCard}>
+              <Text style={styles.qrLabel}>Código QR de la hoja</Text>
+              {result.qr ? (
                 <Text style={styles.qrValue} selectable>
                   {result.qr}
                 </Text>
-              </View>
-            ) : null}
+              ) : (
+                <Text style={styles.qrMissing}>No se pudo leer el QR</Text>
+              )}
+            </View>
           </>
         ) : null}
 
@@ -235,6 +237,11 @@ const styles = StyleSheet.create({
   },
   qrValue: {
     color: '#f0f6fc',
+    fontSize: 15,
+    lineHeight: 22,
+  },
+  qrMissing: {
+    color: '#d29922',
     fontSize: 15,
     lineHeight: 22,
   },
